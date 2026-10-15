@@ -38,6 +38,7 @@ const now = ref(Date.now())
 let tickTimer = null
 let pollTimer = null
 let polling = false
+let pollFailures = 0 // 轮询连续失败次数，偶发抖动不打断流程
 
 /** 校准后的服务端当前时间 */
 const serverNow = computed(function () {
@@ -170,6 +171,7 @@ async function doSeckill() {
 /** 轮询抢购结果：每 400ms 一次，最多 15 秒 */
 function startPolling() {
   stopPolling()
+  pollFailures = 0
   const startedAt = Date.now()
   pollTimer = setInterval(async function () {
     if (Date.now() - startedAt > 15000) {
@@ -204,10 +206,14 @@ function startPolling() {
       }
       loadDetail()
     } catch (e) {
-      stopPolling()
-      seckilling.value = false
-      queued.value = false
-      actionError.value = e.message
+      // 轮询期间的偶发失败（网络抖动 / 服务瞬时 5xx）先重试，连续 3 次才提示
+      pollFailures = pollFailures + 1
+      if (pollFailures >= 3) {
+        stopPolling()
+        seckilling.value = false
+        queued.value = false
+        actionError.value = e.message
+      }
     } finally {
       polling = false
     }

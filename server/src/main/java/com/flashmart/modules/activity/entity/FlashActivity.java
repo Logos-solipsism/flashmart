@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableLogic;
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.baomidou.mybatisplus.annotation.Version;
 import lombok.Data;
 
 import java.time.LocalDateTime;
@@ -42,7 +43,8 @@ public class FlashActivity {
 
     private Integer status;
 
-    /** 乐观锁版本号（商家改活动时防止并发覆盖） */
+    /** 乐观锁版本号（商家改活动时防止并发覆盖，由 MybatisPlusConfig 的乐观锁插件生效） */
+    @Version
     private Integer version;
 
     @TableLogic
@@ -51,10 +53,4 @@ public class FlashActivity {
     private LocalDateTime createTime;
 
     private LocalDateTime updateTime;
-
-    /** 活动是否处于可抢购的时间窗口内 */
-    public boolean inProgress(LocalDateTime now) {
-        return status != null && status == STATUS_ONLINE
-                && now.isAfter(startTime) && now.isBefore(endTime);
-    }
 }

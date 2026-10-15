@@ -48,7 +48,8 @@ public class MqProducer {
 
                     @Override
                     public void onException(Throwable e) {
-                        log.error("延迟消息发送失败 topic={}, key={}", topic, bizKey, e);
+                        log.error("延迟消息异步发送失败，改为同步重发一次 topic={}, key={}", topic, bizKey, e);
+                        syncResend(topic, payload, bizKey, delayLevel);
                     }
                 }, 3000, delayLevel);
             } else {
@@ -60,12 +61,35 @@ public class MqProducer {
 
                     @Override
                     public void onException(Throwable e) {
-                        log.error("消息发送失败 topic={}, key={}", topic, bizKey, e);
+                        // 异步发送失败必须兜底：否则用户看到"抢到了"，消息却没进 broker，订单永远不会落库
+                        log.error("消息异步发送失败，改为同步重发一次 topic={}, key={}", topic, bizKey, e);
+                        syncResend(topic, payload, bizKey, 0);
                     }
                 });
             }
         } catch (Exception e) {
             log.error("消息发送异常 topic={}, key={}", topic, bizKey, e);
+        }
+    }
+
+    /**
+     * 异步发送失败后的兜底：同步再发一次（带 broker 自带的失败重试）。
+     * 仍然失败就记 ERROR —— 这一层不引入本地消息表，属于明确记录的边界。
+     */
+    private void syncResend(String topic, Object payload, String bizKey, int delayLevel) {
+        try {
+            var message = MessageBuilder.withPayload(payload)
+                    .setHeader(org.apache.rocketmq.spring.support.RocketMQHeaders.KEYS, bizKey)
+                    .setHeader(TraceUtil.HEADER, TraceUtil.current())
+                    .build();
+            if (delayLevel > 0) {
+                rocketMQTemplate.syncSend(topic, message, 3000, delayLevel);
+            } else {
+                rocketMQTemplate.syncSend(topic, message, 3000);
+            }
+            log.warn("同步重发成功 topic={}, key={}", topic, bizKey);
+        } catch (Exception ex) {
+            log.error("同步重发仍然失败，消息可能丢失 topic={}, key={}", topic, bizKey, ex);
         }
     }
 

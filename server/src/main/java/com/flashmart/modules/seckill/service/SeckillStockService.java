@@ -61,11 +61,6 @@ public class SeckillStockService {
         return value == null ? fallback : Integer.parseInt(value);
     }
 
-    /** 撤回某个用户的已购记录（超时关单后允许他重新抢） */
-    public void clearUserRecord(Long activityId, Long userId) {
-        redis.opsForHash().delete(ActivityCacheKeys.bought(activityId), String.valueOf(userId));
-    }
-
     /**
      * 原子抢购：判断限购 + 判断库存 + 扣库存 一次完成（见 lua 脚本注释）。
      */

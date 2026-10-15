@@ -62,11 +62,10 @@ flashmart:
     activity-logic-expire-seconds: 60
     # 空值缓存 TTL（秒）：防止不存在的活动反复打到数据库
     null-value-ttl-seconds: 30
-    # 延迟双删的延迟时间（毫秒）
-    double-delete-delay-millis: 500
+    # 延迟双删的延迟时间（秒）：更新库并删缓存后再延迟删一次，
+    # 清掉并发读请求可能回填的旧值。RocketMQ 最小档位是 1 秒，所以这里按秒配
+    double-delete-delay-seconds: 5
   seckill:
-    # 订单超时未支付的关单时间（秒）—— 生产按业务定，演示用 30 秒便于观察
+    # 订单超时未支付的关单时间（秒）—— 生产按业务定，演示用 30 秒便于观察。
+    # 注意：RocketMQ 延迟消息只支持固定档位（1s/5s/10s/30s/1m…），这里会自动取最接近且不小于它的档位
     order-timeout-seconds: 30
-  mock:
-    # 压测时把失败注入打开，用来验证补偿重试
-    pay-fail-rate: 0.0

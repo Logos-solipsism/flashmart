@@ -12,6 +12,7 @@ logs/
 *.log
 
 # ===================== 敏感与本地文件 =====================
+web/.shots/
 bench/tokens.txt
 .env
 .env.local

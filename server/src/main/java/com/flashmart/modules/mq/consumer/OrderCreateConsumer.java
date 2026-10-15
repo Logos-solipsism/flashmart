@@ -15,7 +15,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.common.message.MessageExt;
 import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
+
+import java.time.Duration;
 
 /**
  * 抢购下单消费者：抢购接口的并发压力到这里被"摊平"成顺序的数据库写入。
@@ -35,6 +38,7 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
     private final OrderService orderService;
     private final SeckillStockService stockService;
     private final MqProducer mqProducer;
+    private final StringRedisTemplate redis;
 
     @Override
     public void onMessage(MessageExt message) {
@@ -63,7 +67,7 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
                     event.activityId(), event.productId(), event.flashPrice());
             if (order == null) {
                 // 重复下单：唯一索引已拦下，Redis 侧把这次预扣的库存与机会都还回去
-                stockService.rollbackAll(event.activityId(), event.userId());
+                rollbackOnce(msgId, event);
                 idempotentRepository.markSuccess(msgId);
                 return;
             }
@@ -76,9 +80,25 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
                     event.orderNo(), event.userId(), event.activityId());
         } catch (Exception e) {
             // 数据库库存不足等异常：回滚 Redis 预扣的库存与机会，再抛出去让 MQ 重试 / 进死信
-            stockService.rollbackAll(event.activityId(), event.userId());
+            rollbackOnce(msgId, event);
             idempotentRepository.markFailed(msgId, e.getMessage());
             throw new RuntimeException(e);
         }
+    }
+
+    /**
+     * 回滚 Redis 预扣的库存与机会，且**每条消息只回滚一次**。
+     *
+     * <p>为什么必须做这个保护：MQ 会重试失败的消息，而回滚用的是无上限的 Redis INCR，
+     * 一旦同一条消息被重试多次，库存就会被反复加回去（凭空多出库存，比超卖更难查）。
+     * 这里用一个 SETNX 标记把"每条消息只回滚一次"钉死。
+     */
+    private void rollbackOnce(String msgId, MqEvents.OrderCreateEvent event) {
+        Boolean first = redis.opsForValue().setIfAbsent("seckill:rollback:" + msgId, "1", Duration.ofHours(2));
+        if (!Boolean.TRUE.equals(first)) {
+            log.warn("该消息已经回滚过，跳过重复回滚 msgId={}", msgId);
+            return;
+        }
+        stockService.rollbackAll(event.activityId(), event.userId());
     }
 }

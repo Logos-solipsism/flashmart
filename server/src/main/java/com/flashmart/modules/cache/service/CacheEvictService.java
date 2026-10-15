@@ -34,16 +34,15 @@ public class CacheEvictService {
     private final CacheSyncTaskMapper cacheSyncTaskMapper;
     private final MqProducer mqProducer;
 
-    @Value("${flashmart.cache.double-delete-delay-millis:500}")
-    private long doubleDeleteDelayMillis;
+    @Value("${flashmart.cache.double-delete-delay-seconds:5}")
+    private int doubleDeleteDelaySeconds;
 
     public void evictWithCompensation(String cacheKey) {
         evict(cacheKey);
         // 延迟双删：延迟一段时间再删一次，清掉并发读可能回填的旧值
-        int delaySeconds = Math.max(1, (int) (doubleDeleteDelayMillis / 1000));
         mqProducer.sendAsync(MqTopics.CACHE_EVICT, "cache:" + cacheKey,
                 new MqEvents.CacheEvictEvent(cacheKey, "DOUBLE_DELETE"),
-                MqProducer.nearestDelayLevel(delaySeconds));
+                MqProducer.nearestDelayLevel(doubleDeleteDelaySeconds));
     }
 
     /** 删除缓存；失败则落补偿记录并投递重试消息 */

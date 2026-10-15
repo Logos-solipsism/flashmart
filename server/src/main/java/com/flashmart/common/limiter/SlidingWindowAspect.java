@@ -3,6 +3,7 @@ package com.flashmart.common.limiter;
 import com.flashmart.common.context.UserContext;
 import com.flashmart.common.exception.BizException;
 import com.flashmart.common.trace.TraceUtil;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
@@ -10,6 +11,8 @@ import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
 import org.springframework.stereotype.Component;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 import java.lang.reflect.Method;
 import java.util.UUID;
@@ -27,6 +30,29 @@ public class SlidingWindowAspect {
 
     private final SlidingWindowLimiter limiter;
 
+    /** 当前请求的客户端 IP：优先用拦截器写进上下文的，没有就现取（未登录接口） */
+    private String currentClientIp() {
+        UserContext.LoginUser loginUser = UserContext.get();
+        if (loginUser != null && loginUser.clientIp() != null) {
+            return String.valueOf(loginUser.clientIp());
+        }
+        try {
+            ServletRequestAttributes attributes =
+                    (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+            if (attributes == null) {
+                return "unknown-ip";
+            }
+            HttpServletRequest request = attributes.getRequest();
+            String ip = request.getHeader("X-Forwarded-For");
+            if (ip == null || ip.isBlank()) {
+                ip = request.getRemoteAddr();
+            }
+            return ip.split(",")[0].trim();
+        } catch (Exception e) {
+            return "unknown-ip";
+        }
+    }
+
     @Around("@annotation(com.flashmart.common.limiter.SlidingWindowLimit)")
     public Object around(ProceedingJoinPoint point) throws Throwable {
         Method method = ((MethodSignature) point.getSignature()).getMethod();
@@ -34,10 +60,10 @@ public class SlidingWindowAspect {
 
         String identity = switch (annotation.dimension()) {
             case USER -> String.valueOf(UserContext.userId() == null ? "anonymous" : UserContext.userId());
-            case IP -> {
-                UserContext.LoginUser loginUser = UserContext.get();
-                yield loginUser == null ? "unknown-ip" : String.valueOf(loginUser.clientIp());
-            }
+            // 未登录接口（比如登录、注册）走不到拦截器，UserContext 是空的，
+            // 这时必须从当前 HTTP 请求里取真实 IP —— 否则所有客户端的登录请求会挤进同一个桶，
+            // 变成"全局限流"，一个人刷就能把别人挡住。
+            case IP -> currentClientIp();
             case GLOBAL -> "global";
         };
 

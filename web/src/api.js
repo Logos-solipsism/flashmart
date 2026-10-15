@@ -132,8 +132,10 @@ export async function request(path, options = {}) {
 
   // 限流（429）等非 2xx：直接把后端提示语抛给页面
   if (!res.ok) {
+    const fallback =
+      res.status >= 500 ? '服务暂时不可用，请稍后重试' : '请求失败（HTTP ' + res.status + '）'
     throw makeError(
-      (payload && payload.message) || '请求失败（HTTP ' + res.status + '）',
+      (payload && payload.message) || fallback,
       res.status,
       payload ? payload.code : undefined
     )

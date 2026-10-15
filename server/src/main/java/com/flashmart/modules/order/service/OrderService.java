@@ -88,6 +88,22 @@ public class OrderService {
                 .eq(SeckillOrder::getOrderNo, orderNo).last("limit 1"));
     }
 
+    /**
+     * 订单详情：必须校验归属 —— 只凭订单号就能查别人的订单是典型的越权漏洞。
+     * 订单不存在时给出明确的 404 语义，而不是让空对象一路传到序列化阶段报 500。
+     */
+    public Map<String, Object> detailOfMine(String orderNo) {
+        Long userId = requireUserId();
+        SeckillOrder order = findByOrderNo(orderNo);
+        if (order == null) {
+            throw new BizException(404, "订单不存在或还在生成中，请稍后重试");
+        }
+        if (!userId.equals(order.getUserId())) {
+            throw new BizException(403, "无权查看该订单");
+        }
+        return toVO(order);
+    }
+
     /** 我的订单 */
     public List<Map<String, Object>> myOrders() {
         Long userId = requireUserId();

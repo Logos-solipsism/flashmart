@@ -29,10 +29,10 @@ public class OrderController {
         return R.ok(orderService.myOrders());
     }
 
-    @Operation(summary = "订单详情")
+    @Operation(summary = "订单详情（只能看自己的订单）")
     @GetMapping("/{orderNo}")
     public R<Map<String, Object>> detail(@PathVariable String orderNo) {
-        return R.ok(orderService.toVO(orderService.findByOrderNo(orderNo)));
+        return R.ok(orderService.detailOfMine(orderNo));
     }
 
     /** 支付接口按用户维度限流：防止脚本反复调用支付 */

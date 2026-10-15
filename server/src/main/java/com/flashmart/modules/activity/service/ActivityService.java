@@ -156,7 +156,8 @@ public class ActivityService {
         activityMapper.updateById(activity);
 
         cacheEvictService.evictWithCompensation(ActivityCacheKeys.detail(activityId));
-        prepareStock(activityId, activity.getAvailableStock());
+        // 用 reset 强制覆盖：prepare 带 10 秒 SETNX 互斥，商家 10 秒内连改两次的话第二次不会生效
+        stockService.reset(activityId, activity.getAvailableStock());
     }
 
     /** 把库存写进 Redis（幂等：同一个活动只初始化一次，避免并发覆盖已扣减的库存） */
@@ -173,14 +174,6 @@ public class ActivityService {
     private int fallbackStock(Long activityId) {
         FlashActivity activity = activityMapper.selectById(activityId);
         return activity == null ? 0 : activity.getAvailableStock();
-    }
-
-    public FlashActivity requireActivity(Long activityId) {
-        FlashActivity activity = activityMapper.selectById(activityId);
-        if (activity == null) {
-            throw new BizException("活动不存在");
-        }
-        return activity;
     }
 
     private ActivityCacheVO loadFromDb(Long activityId) {

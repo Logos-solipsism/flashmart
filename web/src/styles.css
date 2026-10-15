@@ -711,7 +711,11 @@ textarea {
   height: 84px;
   border-radius: 8px;
   flex: none;
+  padding: 0 8px;
   font-size: 12px;
+  line-height: 1.35;
+  letter-spacing: 0;
+  text-align: center;
 }
 
 .order-main {

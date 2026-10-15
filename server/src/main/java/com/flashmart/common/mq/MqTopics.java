@@ -19,8 +19,6 @@ public final class MqTopics {
     public static final String CG_ORDER_TIMEOUT = "cg_order_timeout";
     public static final String CG_CACHE_EVICT = "cg_cache_evict";
 
-    public static final String DLQ_ORDER_CREATE = "%DLQ%" + CG_ORDER_CREATE;
-
     private MqTopics() {
     }
 }
