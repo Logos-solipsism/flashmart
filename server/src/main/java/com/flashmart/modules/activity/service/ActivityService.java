@@ -116,6 +116,13 @@ public class ActivityService {
         if (endTime.isBefore(startTime)) {
             throw new BizException("结束时间必须晚于开始时间");
         }
+        // 当前版本每人限购固定 1 件（一人一单）。
+        // 原因：订单表的唯一索引是 (user_id, activity_id)，它只允许同一用户在同一活动下有一条订单；
+        // 如果放开 N>1，第 2 单会被唯一索引拦下，而抢购接口早已返回"抢到了"，
+        // 用户会永远轮询不到订单、也拿不到失败提示 —— 这种"静默失败"比直接拒绝更难查。
+        if (limitPerUser != null && limitPerUser > 1) {
+            throw new BizException("当前版本每人限购 1 件（一人一单），请把限购数设为 1");
+        }
 
         FlashActivity activity = new FlashActivity();
         activity.setProductId(productId);
@@ -124,7 +131,7 @@ public class ActivityService {
         activity.setFlashPrice(flashPrice);
         activity.setTotalStock(totalStock);
         activity.setAvailableStock(totalStock);
-        activity.setLimitPerUser(limitPerUser == null || limitPerUser < 1 ? 1 : limitPerUser);
+        activity.setLimitPerUser(1);
         activity.setStartTime(startTime);
         activity.setEndTime(endTime);
         activity.setStatus(FlashActivity.STATUS_ONLINE);
