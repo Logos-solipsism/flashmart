@@ -16,6 +16,11 @@ public final class ActivityCacheKeys {
         return "seckill:stock:" + activityId;
     }
 
+    /** 活动总库存：回滚库存时的上限，防止把库存加超 */
+    public static String total(Long activityId) {
+        return "seckill:total:" + activityId;
+    }
+
     /** 已购记录：Hash，userId -> 已购数量（一人一单就靠它） */
     public static String bought(Long activityId) {
         return "seckill:bought:" + activityId;

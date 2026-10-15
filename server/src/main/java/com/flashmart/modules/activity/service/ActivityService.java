@@ -133,7 +133,7 @@ public class ActivityService {
         activity.setUpdateTime(LocalDateTime.now());
         activityMapper.insert(activity);
 
-        prepareStock(activity.getId(), totalStock);
+        prepareStock(activity.getId());
         log.info("商家创建活动活动 id={}, 库存={}", activity.getId(), totalStock);
         return activity.getId();
     }
@@ -156,13 +156,25 @@ public class ActivityService {
         activityMapper.updateById(activity);
 
         cacheEvictService.evictWithCompensation(ActivityCacheKeys.detail(activityId));
-        // 用 reset 强制覆盖：prepare 带 10 秒 SETNX 互斥，商家 10 秒内连改两次的话第二次不会生效
-        stockService.reset(activityId, activity.getAvailableStock());
+        // 用 reset 强制覆盖：预热带 10 秒 SETNX 互斥，商家 10 秒内连改两次的话第二次不会生效
+        stockService.reset(activityId, activity.getAvailableStock(), activity.getTotalStock());
     }
 
     /** 把库存写进 Redis（幂等：同一个活动只初始化一次，避免并发覆盖已扣减的库存） */
-    public void prepareStock(Long activityId, int availableStock) {
-        stockService.prepare(activityId, availableStock);
+    public void prepareStock(Long activityId) {
+        FlashActivity activity = activityMapper.selectById(activityId);
+        if (activity == null) {
+            return;
+        }
+        stockService.ensurePrepared(activityId,
+                () -> activity.getAvailableStock(),
+                activity.getTotalStock());
+    }
+
+    /** 数据库侧的剩余库存（缓存预热用，避免拿到活动总库存） */
+    public int currentDbStock(Long activityId) {
+        FlashActivity activity = activityMapper.selectById(activityId);
+        return activity == null ? 0 : activity.getAvailableStock();
     }
 
     /** 实时剩余库存：优先 Redis，未预热时回退数据库 */

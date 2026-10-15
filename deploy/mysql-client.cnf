@@ -1,0 +1,8 @@
+# MySQL 客户端字符集配置。
+# 容器初始化时用 mysql 客户端执行 db/*.sql，如果不显式指定字符集，
+# 中文会被当成 latin1 再编码一次，落库就变成"双重编码"的乱码（现象：接口新建的数据正常，种子数据全是问号/怪字符）。
+[client]
+default-character-set=utf8mb4
+
+[mysql]
+default-character-set=utf8mb4

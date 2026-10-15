@@ -61,7 +61,7 @@ public class BenchService {
         activity.setUpdateTime(LocalDateTime.now());
         activityMapper.updateById(activity);
 
-        stockService.reset(activityId, stock);
+        stockService.reset(activityId, stock, stock);
         cacheClient.evict(ActivityCacheKeys.detail(activityId));
         resetCacheLoadCount(activityId);
 
@@ -90,7 +90,10 @@ public class BenchService {
         if (activity == null) {
             throw new BizException("活动不存在");
         }
-        stockService.prepare(activityId, activity.getAvailableStock());
+        stockService.ensurePrepared(activityId,
+                () -> activityMapper.selectById(activityId).getAvailableStock(),
+                activity.getTotalStock());
+        // 压测接口按"不限购"处理（每个请求都是不同的合成用户），这里传 int 最大值是刻意的
         long remaining = stockService.trySeckill(activityId, syntheticUserId, Integer.MAX_VALUE);
         if (remaining == SeckillStockService.SOLD_OUT) {
             throw new BizException("已被抢光");

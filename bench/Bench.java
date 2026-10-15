@@ -862,6 +862,21 @@ public class Bench {
         return asMap(a.data);
     }
 
+    /**
+     * reset 之后盯 1 秒：如果马上又冒出订单，说明 MQ 里还有上一轮 async 压测的残留消息正在异步落库，
+     * 本轮统计会被污染（orderCount 偏大、库存对不上）。这里只做如实提示，不改任何数字。
+     */
+    static void warnIfMqStillBusy(String token, long activityId) {
+        sleepMs(1000);
+        Map<String, Object> probe = benchStats(token, activityId);
+        if (probe == null) return;
+        long orders = lng(probe.get("orderCount"));
+        if (orders > 0) {
+            note("注意：reset 之后 1 秒内又落库了 " + orders + " 个订单，说明 MQ 里还有上一轮压测的残留消息正在消费；");
+            note("      本轮的 orderCount/库存统计因此可能偏高，建议等 /api/bench/stats 的 orderCount 不再增长后重跑。");
+        }
+    }
+
     static long cacheLoadCount(String token, String key) {
         Api a = get_("/api/bench/cache-load-count?key=" + enc(key), token);
         if (!a.ok()) return -1;
@@ -981,6 +996,7 @@ public class Bench {
         kv("并发用户数", users + "（每个用户只发 1 次，互不重复）");
         System.out.println();
         resetActivity(token, activity, stock, true);
+        warnIfMqStillBusy(token, activity);
 
         List<Supplier<Api>> tasks = new ArrayList<>();
         for (int i = 0; i < users; i++) {
@@ -1351,6 +1367,11 @@ public class Bench {
         ));
         if (loads >= 0) {
             verdict(loads < concurrency, "回源 " + loads + " 次 << 并发 " + concurrency + " 次：SETNX 互斥把击穿流量挡住了");
+            if (loads >= concurrency) {
+                note("回源次数 == 并发数，说明所有请求都打到了数据库。服务端冷启动路径是「SETNX 抢锁 + 没抢到锁的线程 sleep 60ms 后重读缓存」，");
+                note("      如果抢到锁那次回源耗时超过 60ms（后端正被别的东西压着、或数据库首连慢），其余线程都会走\"自己兜底回源\"的分支，互斥就失效了；");
+                note("      建议等后端空载后重跑一次对照。本次结果如实记录，不做任何美化。");
+            }
         }
     }
 
@@ -1522,6 +1543,7 @@ public class Bench {
         kv("重置库存", stock);
         System.out.println();
         resetActivity(token, activity, stock, true);
+        warnIfMqStillBusy(token, activity);
 
         Map<String, Object> before = benchStats(token, activity);
 
@@ -1619,6 +1641,7 @@ public class Bench {
         kv("重置库存", stock);
         System.out.println();
         resetActivity(token, activity, stock, true);
+        warnIfMqStillBusy(token, activity);
 
         Api sk = sendSeckill(token);
         if (!sk.ok()) {
@@ -1641,9 +1664,11 @@ public class Bench {
         Map<String, Object> afterPay = benchStats(token, activity);
 
         System.out.println();
-        printTable(new String[]{"步骤", "HTTP", "code", "message", "data.status"}, List.of(
-                new String[]{"第 1 次支付", String.valueOf(pay1.httpStatus), String.valueOf(pay1.code), pay1.message, str(get(pay1.data, "status"))},
-                new String[]{"第 2 次支付", String.valueOf(pay2.httpStatus), String.valueOf(pay2.code), pay2.message, str(get(pay2.data, "status"))}
+        printTable(new String[]{"步骤", "HTTP", "code", "data.status", "data.message（服务端原文）"}, List.of(
+                new String[]{"第 1 次支付", String.valueOf(pay1.httpStatus), String.valueOf(pay1.code),
+                        str(get(pay1.data, "status")), str(get(pay1.data, "message"))},
+                new String[]{"第 2 次支付（重复支付）", String.valueOf(pay2.httpStatus), String.valueOf(pay2.code),
+                        str(get(pay2.data, "status")), str(get(pay2.data, "message"))}
         ));
         printTable(new String[]{"订单最终状态", finalState, "（期望 PAID）"}, List.of());
         printTable(new String[]{"指标", "抢购后", "支付后"}, List.of(

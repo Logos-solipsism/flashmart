@@ -31,6 +31,7 @@ const order = ref(null) // 抢购成功后拿到的订单
 const actionError = ref('') // 抢购/支付失败提示（后端原文）
 const actionTip = ref('')
 const paying = ref(false)
+const pollTimedOut = ref(false) // 轮询超时（订单还在队列里）
 
 // 倒计时：以服务端时间为准，避免前端时钟不准
 const serverOffset = ref(0)
@@ -152,6 +153,7 @@ async function doSeckill() {
   order.value = null
   orderNo.value = ''
   queued.value = false
+  pollTimedOut.value = false
   seckilling.value = true
 
   try {
@@ -178,6 +180,7 @@ function startPolling() {
       stopPolling()
       seckilling.value = false
       queued.value = false
+      pollTimedOut.value = true
       actionError.value = '订单生成较慢，请稍后到「我的订单」查看结果'
       return
     }
@@ -327,6 +330,10 @@ async function pay() {
           >
             {{ buyText }}
           </button>
+
+          <div v-if="pollTimedOut" class="mt-12">
+            <button class="btn" type="button" @click="router.push('/orders')">查看我的订单</button>
+          </div>
 
           <!-- 抢购成功后的订单卡片：支付倒计时 + 去支付 -->
           <div v-if="order" class="card mt-16">

@@ -59,7 +59,8 @@ public class OrderService {
         // 1) 扣数据库库存：WHERE available_stock > 0 保证数据库这一层也不会扣成负数
         int affected = activityMapper.decreaseStock(activityId);
         if (affected == 0) {
-            throw new BizException("数据库库存不足，已回滚 Redis 库存");
+            // 这里只回滚了数据库这一侧；Redis 侧预扣的库存与机会由调用方（消费者）回滚
+            throw new BizException("数据库库存已扣不动，本次下单失败");
         }
         try {
             SeckillOrder order = new SeckillOrder();
@@ -166,7 +167,7 @@ public class OrderService {
         // 只回滚库存、不回滚"该用户的已购记录"：名额已经用掉，不付款就作废，库存退回给其他人抢。
         activityMapper.increaseStock(order.getActivityId());
         stockService.rollbackStock(order.getActivityId());
-        log.info("超时关单并回滚库存 orderNo={}, activityId={}", orderNo, order.getActivityId());
+        log.info("超时关单并回滚库存（且不退还该用户的抢购机会）orderNo={}, activityId={}", orderNo, order.getActivityId());
         return true;
     }
 

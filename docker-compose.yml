@@ -16,6 +16,8 @@ services:
       # 逐个挂载并加数字前缀：容器按文件名字母序执行初始化脚本
       - ./server/src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./server/src/main/resources/db/data.sql:/docker-entrypoint-initdb.d/02-data.sql
+      # 初始化用的 mysql 客户端必须是 utf8mb4，否则中文种子数据会二次编码成乱码
+      - ./deploy/mysql-client.cnf:/etc/mysql/conf.d/charset.cnf
 
   redis:
     image: redis:7.2

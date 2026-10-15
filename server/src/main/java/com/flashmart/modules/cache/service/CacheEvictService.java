@@ -60,6 +60,6 @@ public class CacheEvictService {
         task.setUpdateTime(LocalDateTime.now());
         cacheSyncTaskMapper.insert(task);
         mqProducer.sendAsync(MqTopics.CACHE_EVICT, "cache:" + cacheKey,
-                new MqEvents.CacheEvictEvent(cacheKey, "UPDATE"));
+                new MqEvents.CacheEvictEvent(cacheKey, "UPDATE"), 0);
     }
 }

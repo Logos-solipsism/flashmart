@@ -55,8 +55,11 @@ public class SeckillService {
             throw new BizException("活动已结束");
         }
 
-        // ② 库存预热（懒加载，幂等）+ Lua 原子扣减
-        stockService.prepare(activityId, activity.totalStock());
+        // ② 库存预热（懒加载，幂等）+ Lua 原子扣减。
+        //    预热值取数据库的"剩余库存"而不是活动总库存，否则库存 key 丢失后会把已售出的补回来
+        stockService.ensurePrepared(activityId,
+                () -> activityService.currentDbStock(activityId),
+                activity.totalStock());
         long result = stockService.trySeckill(activityId, userId, activity.limitPerUser());
         if (result == SeckillStockService.OVER_LIMIT) {
             throw new BizException("每人限购 " + activity.limitPerUser() + " 件，你已经抢到啦");
