@@ -1,0 +1,28 @@
+# ===================== 构建产物 =====================
+target/
+*.class
+*.jar
+web/node_modules/
+web/dist/
+dist/
+
+# ===================== 本机运行数据 =====================
+data/
+logs/
+*.log
+
+# ===================== 敏感与本地文件 =====================
+bench/tokens.txt
+.env
+.env.local
+*.pem
+*.key
+
+# ===================== IDE / 系统 =====================
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.DS_Store
+Thumbs.db

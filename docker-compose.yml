@@ -1,0 +1,70 @@
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    container_name: flashmart-mysql
+    ports:
+      # 宿主机映射到 13307（容器内仍是 3306），避开本机其他项目占用的 3306 / 13306
+      - "13307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root123456
+      MYSQL_DATABASE: flashmart
+      TZ: Asia/Shanghai
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 逐个挂载并加数字前缀：容器按文件名字母序执行初始化脚本
+      - ./server/src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./server/src/main/resources/db/data.sql:/docker-entrypoint-initdb.d/02-data.sql
+
+  redis:
+    image: redis:7.2
+    restart: unless-stopped
+    container_name: flashmart-redis
+    ports:
+      - "6380:6379"
+    command: redis-server --appendonly yes --requirepass redis123456
+    volumes:
+      - redis-data:/data
+
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.1.4
+    restart: unless-stopped
+    container_name: flashmart-namesrv
+    ports:
+      - "9877:9876"
+    command: sh mqnamesrv
+
+  rocketmq-broker:
+    image: apache/rocketmq:5.1.4
+    restart: unless-stopped
+    container_name: flashmart-broker
+    # 数据卷默认属于 root，而 RocketMQ 默认以 rocketmq 用户运行 → 会写不进存储目录导致启动失败
+    user: root
+    depends_on:
+      - rocketmq-namesrv
+    ports:
+      - "10910:10909"
+      - "10912:10911"
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+    command: sh mqbroker -c /home/rocketmq/broker.conf
+    volumes:
+      - ./deploy/broker.conf:/home/rocketmq/broker.conf
+      - rocketmq-store:/home/rocketmq/store
+
+  rocketmq-dashboard:
+    image: apacherocketmq/rocketmq-dashboard:latest
+    restart: unless-stopped
+    container_name: flashmart-dashboard
+    depends_on:
+      - rocketmq-namesrv
+    ports:
+      - "8181:8080"
+    environment:
+      JAVA_OPTS: "-Drocketmq.namesrv.addr=rocketmq-namesrv:9876"
+
+volumes:
+  mysql-data:
+  redis-data:
+  rocketmq-store:
