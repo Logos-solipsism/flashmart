@@ -69,16 +69,41 @@ public class RedisCacheClient {
             return null;
         }
 
-        // 2) 未命中：回源一次；查不到就写空值标记，防止后续请求继续打库
+        // 2) 完全未命中（缓存刚被删或从没写过）：用 SETNX 只放一个线程回源，其余短暂等待后重读缓存。
+        //    不这样做的话，热点 key 被删的瞬间会有 N 个并发请求同时打到数据库（冷启动击穿）。
         if (cached == null) {
-            countLoad(key);
-            T loaded = loader.get();
-            if (loaded == null) {
-                redis.opsForValue().set(key, NULL_MARK, Duration.ofSeconds(nullValueTtlSeconds));
+            String lockKey = REBUILD_LOCK_PREFIX + key;
+            Boolean got = redis.opsForValue().setIfAbsent(lockKey, UUID.randomUUID().toString(), Duration.ofSeconds(10));
+            if (Boolean.TRUE.equals(got)) {
+                try {
+                    countLoad(key);
+                    T loaded = loader.get();
+                    if (loaded == null) {
+                        redis.opsForValue().set(key, NULL_MARK, Duration.ofSeconds(nullValueTtlSeconds));
+                        return null;
+                    }
+                    writeWithLogicExpire(key, loaded, logicTtlSeconds);
+                    return loaded;
+                } finally {
+                    redis.delete(lockKey);
+                }
+            }
+            // 没抢到锁：等一小会儿再读缓存（此时别人正在重建），仍读不到才自己兜底回源
+            sleepQuietly(60);
+            String retry = redis.opsForValue().get(key);
+            if (NULL_MARK.equals(retry)) {
                 return null;
             }
-            writeWithLogicExpire(key, loaded, logicTtlSeconds);
-            return loaded;
+            if (retry != null) {
+                try {
+                    JsonNode node = objectMapper.readTree(retry);
+                    return objectMapper.treeToValue(node.path("data"), type);
+                } catch (Exception ignored) {
+                    // 解析失败就往下走，自己回源
+                }
+            }
+            countLoad(key);
+            return loader.get();
         }
 
         // 3) 命中：判断逻辑过期时间
@@ -98,6 +123,14 @@ public class RedisCacheClient {
                 writeWithLogicExpire(key, loaded, logicTtlSeconds);
             }
             return loaded;
+        }
+    }
+
+    private void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
