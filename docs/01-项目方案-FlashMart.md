@@ -167,7 +167,7 @@
   - 只有关单成功才做双端回滚：`FlashActivityMapper.increaseStock`（`WHERE available_stock < total_stock` 防止回滚超过总库存）+ `SeckillStockService.rollbackStock`（Redis 走 `lua/rollback_stock.lua`：只有当前库存小于 `seckill:total:{id}` 时才 +1，避免在途的关单消息把库存加超总量）；
   - 支付侧 `SeckillOrderMapper.payWithVersion`：`WHERE order_no = ? AND status = 'PENDING_PAY' AND version = ?` 且 `version = version + 1`，这就是"乐观锁"落点 —— 读到的 version 在写回时已经被别人改过，更新就会失败，避免"支付回调与关单互相覆盖"。
 - **关键类**：`OrderCreateConsumer`、`OrderTimeoutConsumer`、`OrderService`、`SeckillOrderMapper`、`FlashActivityMapper`、`MqProducer`。
-- **实测口径**：延迟 **30 秒**的消息到点后关单成功（轮询在 **22 ms** 内就看到订单从 `PENDING_PAY` 变成 `TIMEOUT`）、Redis 与数据库库存**各回滚 +1**，订单状态分布为 `PAID:1 / TIMEOUT:1`（一笔支付成功、一笔超时关单，两条路径互不干扰）。关单后同一用户再抢会被"每人限购 1 件"拦下 —— 这是设计如此，见第 11 节 FAQ 第 9 条。
+- **实测口径**：**生产档位（30 秒）**——抢购后不支付，**第 30 秒订单状态变为 `TIMEOUT`**，Redis 与数据库库存**各回滚 +1**；压测工具里的 timeout 实验走的是"1 秒档强制关单"接口（为了快速验证），那组观察值是"关单消息到点后，下一次轮询在 **22 ms** 内看到 `TIMEOUT`"。订单状态分布曾出现 `PAID:1 / TIMEOUT:1`（一笔支付成功、一笔超时关单，两条路径互不干扰）。关单后同一用户再抢会被"每人限购 1 件"拦下 —— 这是设计如此，见第 11 节 FAQ 第 9 条。
 
 ## 7. 数据模型（核心表与关键索引）
 
