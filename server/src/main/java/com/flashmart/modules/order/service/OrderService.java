@@ -146,9 +146,10 @@ public class OrderService {
             log.info("订单已不是待支付状态，关单跳过 orderNo={}, status={}", orderNo, order.getStatus());
             return false;
         }
-        // 关单成功才回滚库存（数据库 + Redis 两边）
+        // 关单成功才回滚库存（数据库 + Redis 两边）。
+        // 只回滚库存、不回滚"该用户的已购记录"：名额已经用掉，不付款就作废，库存退回给其他人抢。
         activityMapper.increaseStock(order.getActivityId());
-        stockService.rollback(order.getActivityId(), order.getUserId());
+        stockService.rollbackStock(order.getActivityId());
         log.info("超时关单并回滚库存 orderNo={}, activityId={}", orderNo, order.getActivityId());
         return true;
     }

@@ -35,14 +35,14 @@ public class BenchController {
     @Operation(summary = "异步版抢购（Lua + MQ，合成用户，跳过一人一单）")
     @PostMapping("/seckill-async/{activityId}")
     public R<Map<String, Object>> seckillAsync(@PathVariable Long activityId,
-                                               @RequestParam(defaultValue = "900000") Long syntheticUserId) {
+                                               @RequestParam(required = false) Long syntheticUserId) {
         return R.ok(benchService.seckillAsyncSynthetic(activityId, syntheticUserId));
     }
 
     @Operation(summary = "同步版抢购（对照组：同步扣库存 + 写订单）")
     @PostMapping("/seckill-sync/{activityId}")
     public R<Map<String, Object>> seckillSync(@PathVariable Long activityId,
-                                              @RequestParam(defaultValue = "900000") Long syntheticUserId) {
+                                              @RequestParam(required = false) Long syntheticUserId) {
         return R.ok(benchService.seckillSync(activityId, syntheticUserId));
     }
 
@@ -62,5 +62,11 @@ public class BenchController {
     @GetMapping("/cache-load-count")
     public R<Map<String, Object>> cacheLoadCount(@RequestParam String key) {
         return R.ok(benchService.cacheLoadCount(key));
+    }
+
+    @Operation(summary = "重置某个 key 的回源计数")
+    @PostMapping("/cache-load-count/reset")
+    public R<Map<String, Object>> resetCacheLoadCount(@RequestParam String key) {
+        return R.ok(benchService.resetCacheLoadCount(key));
     }
 }

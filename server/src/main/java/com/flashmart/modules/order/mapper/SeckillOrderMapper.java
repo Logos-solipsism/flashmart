@@ -2,6 +2,7 @@ package com.flashmart.modules.order.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.flashmart.modules.order.entity.SeckillOrder;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Update;
@@ -20,6 +21,14 @@ public interface SeckillOrderMapper extends BaseMapper<SeckillOrder> {
     int payWithVersion(@Param("orderNo") String orderNo,
                        @Param("tradeNo") String tradeNo,
                        @Param("version") Integer version);
+
+    /**
+     * 物理删除某个活动的订单（压测重置用）。
+     * 不能用 MyBatis-Plus 的 delete：它是逻辑删除，被标记 deleted=1 的行仍然占着
+     * unique(user_id, activity_id)，会让同一用户之后再也下不了单。
+     */
+    @Delete("DELETE FROM seckill_order WHERE activity_id = #{activityId}")
+    int deleteByActivityPhysically(@Param("activityId") Long activityId);
 
     /** 超时关单：同样只允许从 PENDING_PAY 出发（已支付的订单不会被关掉） */
     @Update("UPDATE seckill_order SET status = 'TIMEOUT', cancel_time = NOW(), cancel_reason = 'TIMEOUT', "

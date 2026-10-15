@@ -77,8 +77,20 @@ public class SeckillStockService {
         return result == null ? NOT_PREPARED : result;
     }
 
-    /** 回滚：库存 +1，已购记录 -1（下单失败或超时关单时调用） */
-    public void rollback(Long activityId, Long userId) {
+    /**
+     * 只回滚库存（超时关单时用）。
+     * 注意这里是<b>故意不回滚已购记录</b>的：名额已经用掉了，用户不付款就作废，
+     * 库存退回池子里给其他人抢 —— 这正是真实秒杀的做法（限购机会只有一次）。
+     */
+    public void rollbackStock(Long activityId) {
+        redis.opsForValue().increment(ActivityCacheKeys.stock(activityId));
+    }
+
+    /**
+     * 回滚库存 + 撤销已购记录（下单失败时用）。
+     * 这种场景用户什么都没拿到（订单根本没落库），所以要把他这次的机会还回去。
+     */
+    public void rollbackAll(Long activityId, Long userId) {
         redis.opsForValue().increment(ActivityCacheKeys.stock(activityId));
         redis.opsForHash().increment(ActivityCacheKeys.bought(activityId), String.valueOf(userId), -1);
     }

@@ -62,8 +62,8 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
             SeckillOrder order = orderService.createOrder(event.orderNo(), event.userId(),
                     event.activityId(), event.productId(), event.flashPrice());
             if (order == null) {
-                // 重复下单：唯一索引已拦下，Redis 侧把这次预扣的库存还回去
-                stockService.rollback(event.activityId(), event.userId());
+                // 重复下单：唯一索引已拦下，Redis 侧把这次预扣的库存与机会都还回去
+                stockService.rollbackAll(event.activityId(), event.userId());
                 idempotentRepository.markSuccess(msgId);
                 return;
             }
@@ -75,8 +75,8 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
             log.info("订单创建成功 orderNo={}, userId={}, activityId={}",
                     event.orderNo(), event.userId(), event.activityId());
         } catch (Exception e) {
-            // 数据库库存不足等异常：回滚 Redis 预扣的库存，再抛出去让 MQ 重试 / 进死信
-            stockService.rollback(event.activityId(), event.userId());
+            // 数据库库存不足等异常：回滚 Redis 预扣的库存与机会，再抛出去让 MQ 重试 / 进死信
+            stockService.rollbackAll(event.activityId(), event.userId());
             idempotentRepository.markFailed(msgId, e.getMessage());
             throw new RuntimeException(e);
         }

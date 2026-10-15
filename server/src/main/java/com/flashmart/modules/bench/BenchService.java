@@ -23,6 +23,7 @@ import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * 压测专用服务（只有 bench profile 才注册）。
@@ -66,8 +67,8 @@ public class BenchService {
 
         int deleted = 0;
         if (clearOrders) {
-            deleted = orderMapper.delete(Wrappers.<SeckillOrder>lambdaQuery()
-                    .eq(SeckillOrder::getActivityId, activityId));
+            // 物理删除：逻辑删除的行仍会占用 unique(user_id, activity_id)，会让用户之后下不了单
+            deleted = orderMapper.deleteByActivityPhysically(activityId);
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("activityId", activityId);
@@ -76,8 +77,15 @@ public class BenchService {
         return result;
     }
 
-    /** 异步版：Lua 扣减 + 发 MQ，立刻返回（线上抢购链路的等价实现） */
+    /**
+     * 异步版：Lua 扣减 + 发 MQ，立刻返回（线上抢购链路的等价实现）。
+     * syntheticUserId 为空时随机生成一个高位用户 id —— 压测要模拟"很多人在抢"，
+     * 每个请求都得是不同的人，否则会被"一人一单"挡住。
+     */
     public Map<String, Object> seckillAsyncSynthetic(Long activityId, Long syntheticUserId) {
+        if (syntheticUserId == null) {
+            syntheticUserId = 9_000_000L + ThreadLocalRandom.current().nextInt(900_000_000);
+        }
         FlashActivity activity = activityMapper.selectById(activityId);
         if (activity == null) {
             throw new BizException("活动不存在");
@@ -100,6 +108,9 @@ public class BenchService {
     /** 同步版（对照组）：扣数据库库存 + 写订单，全部在请求线程里做完，不发消息 */
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> seckillSync(Long activityId, Long syntheticUserId) {
+        if (syntheticUserId == null) {
+            syntheticUserId = 9_000_000L + ThreadLocalRandom.current().nextInt(900_000_000);
+        }
         FlashActivity activity = activityMapper.selectById(activityId);
         if (activity == null) {
             throw new BizException("活动不存在");
@@ -161,5 +172,11 @@ public class BenchService {
 
     public void resetCacheLoadCount(Long activityId) {
         cacheClient.evict("cache:loadcount:" + ActivityCacheKeys.detail(activityId));
+    }
+
+    /** 重置任意 key 的回源计数（穿透实验会查不存在的活动） */
+    public Map<String, Object> resetCacheLoadCount(String key) {
+        cacheClient.evict("cache:loadcount:" + key);
+        return Map.of("key", key, "loadCount", 0);
     }
 }

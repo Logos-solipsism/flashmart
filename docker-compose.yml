@@ -44,8 +44,9 @@ services:
     depends_on:
       - rocketmq-namesrv
     ports:
-      - "10910:10909"
-      - "10912:10911"
+      # listenPort 与 broker.conf 保持一致；HA 端口只是备用，映射到 10913 避开其他项目
+      - "10913:10909"
+      - "10912:10912"
     environment:
       NAMESRV_ADDR: rocketmq-namesrv:9876
     command: sh mqbroker -c /home/rocketmq/broker.conf
