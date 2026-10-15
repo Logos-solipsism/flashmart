@@ -1,6 +1,6 @@
 # FlashMart 压测 / 实验工具（bench）
 
-纯 JDK 的单文件压测工具，用来把简历里那些数字（"500 并发不超卖"、"2000 请求 P99 xx ms"、
+纯 JDK 的单文件压测工具，用来把系统的关键指标（"30 件库存会不会超卖"、"2000 请求 P99 多少毫秒"、
 "缓存击穿只回源 1 次"……）在本机**真实跑出来**。工具只做两件事：发请求、把结果算成给人看的表格；
 所有结论都来自服务端返回的真实数据，测不到就打印"未获取到"，绝不编数字。
 
@@ -167,14 +167,21 @@ reset → 抢购 → 轮询到 `PENDING_PAY` → 支付 → **再支付一次**�
 | cache-penetrate | `--exp cache-penetrate --activity 99999 --times 200` | 200 次全部 `code=400 活动不存在`，**累计回源 1 次** |
 | ratelimit | `--exp ratelimit` | 1 秒内 10 并发 → HTTP 200 × 5 / HTTP 429 × 5；1.2 秒匀速 5 次 → 全部通过 |
 | oversell | `--exp oversell --stock 30 --users 60` | 成功 30 + 抢光 30；`orderCount=30 == 成功数`，`dbAvailableStock=0`、`redisAvailableStock=0`，无超卖 |
-| throughput async | `--mode async --concurrency 50 --requests 2000` | 2000/2000 成功，152 req/s，P50 314 ms，P99 546 ms |
-| throughput sync | `--mode sync --concurrency 50 --requests 2000` | 2000/2000 成功，38 req/s，P50 1291 ms，P99 1776 ms |
+| throughput async | `--mode async --concurrency 50 --requests 2000` | 2000/2000 成功，**176 req/s**，平均 280.66 ms，P50 282 ms，P90 307 ms，P95 315 ms，**P99 329 ms** |
+| throughput sync | `--mode sync --concurrency 50 --requests 2000` | 2000/2000 成功，**39 req/s**，平均 1259.62 ms，P50 1261 ms，P90 1359 ms，P95 1394 ms，**P99 1462 ms** |
 | cache-miss | `--exp cache-miss --concurrency 100` | 后端空载：100 并发 → 回源 **1** 次；后端被压时：回源 100 次（见下） |
 | timeout | `--exp timeout` | `PENDING_PAY → TIMEOUT`，DB/Redis 库存各 +1（100→99→100） |
 | pay | `--exp pay` | 两次支付都 `PAID`，第二次 message=`订单已支付，无需重复支付` |
 
-**async vs sync（同样 50 并发 / 2000 请求 / stock=1000000）**：异步版吞吐约 4 倍、P50 约 1/4，
+**async vs sync（同样 50 并发 / 2000 请求 / stock=1000000）**：异步版吞吐 **176 vs 39 req/s（约 4.5 倍）**，
+单请求平均耗时 **280.66 ms vs 1259.62 ms（降约 78%）**，P99 **329 ms vs 1462 ms（降约 77%）** ——
 这就是"流量削峰"要证明的东西。
+
+**对比实验的纪律**（否则数字会互相污染，实测踩过）：
+1. 两组必须在**同样的背景噪音**下测：先把上一轮的 MQ 消息消费干净（轮询 `/api/bench/stats` 直到 orderCount 不再增长）再跑下一组；
+2. 把订单超时时间调长（例如启动参数加 `--flashmart.seckill.order-timeout-seconds=600`），
+   否则实验跑到 30 秒后，前面的订单会被超时关单，额外的库存回滚与状态更新会干扰吞吐；
+3. 每次跑之前用 `--exp oversell` 或 reset 接口清库存与订单，保证起点一致。
 
 ---
 
