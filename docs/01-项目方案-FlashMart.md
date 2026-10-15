@@ -82,7 +82,7 @@
              ▼
     MySQL 8 (:13307)                       Redis 7.2 (:6380)
     sys_user / product / flash_activity     activity:detail:{id}    逻辑过期 + 空值标记
-    seckill_order / mq_consume_log          seckill:stock:{id}      库存真身（Lua 扣减）
+    seckill_order / mq_consume_log          seckill:stock:{id}      库存真身（Lua 扣减）；seckill:total:{id} 活动总库存（回滚上限）
     cache_sync_task                         seckill:bought:{id}     一人一单 Hash
                                             rate:{key}:{维度}:{身份} 滑动窗口 ZSet
                                             session:token:{userId}   登录会话
@@ -97,10 +97,10 @@
 - **方案**：把"判断库存 + 判断限购 + 扣库存 + 记录已购"合成一次 `EVALSHA`，Redis 单线程执行天然互斥。
   - 脚本：`server/src/main/resources/lua/seckill_stock.lua`，KEYS = 库存 key + 已购 Hash key，ARGV = userId + 每人限购数；
   - 返回值语义：`>=0` 扣减后的剩余库存、`-1` 库存不足、`-2` 超过限购、`-3` 活动未预热，常量定义在 `SeckillStockService.SOLD_OUT / OVER_LIMIT / NOT_PREPARED`；
-  - 库存预热是幂等的（`SeckillStockService.prepare` 用 `SETNX seckill:stock:init:{id}` + 10 秒 TTL 做互斥），避免并发把已扣减的库存覆盖回去；
-  - **数据库侧兜底**：`seckill_order` 上的 `UNIQUE KEY uk_user_activity (user_id, activity_id)`。`OrderService.createOrder` 捕获 `DuplicateKeyException` 后把刚扣掉的数据库库存还回去并返回 `null`，消费端据此走 `stockService.rollbackAll`（库存与已购记录一起还）。
+  - 库存预热是幂等的：`SeckillStockService.ensurePrepared(activityId, dbAvailableStock, totalStock)` **先看 `seckill:stock:{id}` 存不存在，存在就直接返回**（快路径），不存在才用 `SETNX seckill:stock:init:{id}` + 10 秒 TTL 做互斥，避免并发把已扣减的库存覆盖回去；**预热值取数据库的 `available_stock` 而不是活动总库存** —— 库存 key 一旦丢失，按总库存重建会把已经卖出去的部分补回来，凭空多出库存；
+  - **数据库侧兜底**：`seckill_order` 上的 `UNIQUE KEY uk_user_activity (user_id, activity_id)`。`OrderService.createOrder` 捕获 `DuplicateKeyException` 后把刚扣掉的数据库库存还回去并返回 `null`，消费端据此走 `OrderCreateConsumer.rollbackOnce`（内部调 `stockService.rollbackAll`，库存与已购记录一起还；`seckill:rollback:{msgId}` 的 SETNX 保证**每条消息只回滚一次**，Redis 侧回滚还带上限，见 `lua/rollback_stock.lua`）。
 - **关键类**：`SeckillStockService`、`SeckillService`、`ActivityCacheKeys`、`lua/seckill_stock.lua`、`OrderService`、`schema.sql`。
-- **实测口径**：同一用户对同一活动并发抢购，只有 1 次成功进入队列，其余被"每人限购 1 件"拦下（`bench/Bench.java --exp oneuser`；200 并发不同用户抢 100 件时 `orderCount == 成功数 <= totalStock`，Redis 与数据库剩余库存均非负）。
+- **实测口径**：同一用户并发 20 次抢购 → **成功 1 次 + 限购 4 次 + 429 共 15 次**（限流在限购之前生效）；改成每 1.2 秒 1 次匀速请求 → 限流 0 次、全部被"一人一单"拦下。超卖验证（活动 **30 件库存 / 60 个不同用户并发**）：**成功 30 次、落库 30 单、数据库剩余库存 0、Redis 剩余库存 0**，无超卖、库存非负。口径：本机 Windows + Docker 中间件、压测客户端与服务同机、闭环压测模型，测前清空数据表并等 MQ 排空。
 
 ### 技术点 2：RocketMQ 异步下单削峰
 
@@ -111,8 +111,8 @@
   - 消费者 `@RocketMQMessageListener(consumeThreadMax = 32)`，并发度远低于用户点击并发，这就是"削峰"的实际含义：**数据库只面对 MQ 的消费速度**；
   - 消费端第一步是 `MqIdempotentRepository.tryAcquire(msgId, ...)`，靠 `mq_consume_log.uk_msg_id` 唯一索引做幂等，重复消息直接丢弃。
 - **关键类**：`SeckillService`、`MqProducer`、`MqTopics`、`MqEvents`、`OrderCreateConsumer`、`MqIdempotentRepository`。
-- **实测口径**：抢购接口返回耗时 **28ms**；接口返回后约 **157ms** 订单落库（前端轮询 `/api/seckill/result/{orderNo}` 从 `QUEUING` 变为 `PENDING_PAY`）。
-- **对照组**：`BenchService.seckillSync`（接口 `POST /api/bench/seckill-sync/{activityId}`）走"同步扣库存 + 同步写订单"，与异步版共用同一套数据库操作，唯一差别是不发消息。异步/同步的 P99 与吞吐对比数字**待补**，采集入口已就绪：`java Bench.java --exp throughput --mode async|sync`。
+- **实测口径**：抢购接口返回耗时 **28ms**；接口返回后约 **157ms** 订单落库（前端轮询 `/api/seckill/result/{orderNo}` 从 `QUEUING` 变为 `PENDING_PAY`）。削峰对照压测（50 并发 / 2000 请求，压测客户端与服务同机）：**异步 176 req/s、平均 280.66ms、P50 282ms、P90 307ms、P95 315ms、P99 329ms**；**同步（对照组）39 req/s、平均 1259.62ms、P50 1261ms、P90 1359ms、P95 1394ms、P99 1462ms** → **吞吐约 4.5 倍、单请求平均耗时降约 78%、P99 降约 77%**。
+- **对照组**：`BenchService.seckillSync`（接口 `POST /api/bench/seckill-sync/{activityId}`）走"同步扣库存 + 同步写订单"，与异步版共用同一套数据库操作，唯一差别是不发消息。异步/同步的对比数字**已实测**（见上一条：异步 176 req/s vs 同步 39 req/s），采集入口：`java Bench.java --exp throughput --mode async|sync`。
 
 ### 技术点 3：逻辑过期 + 异步重建防缓存击穿
 
@@ -122,7 +122,7 @@
   - 逻辑过期时**不删 key**，当前请求直接返回旧值，同时用 `SETNX cache:rebuild:lock:{key}`（TTL 10 秒）挑一个线程提交到 `rebuildPool`（4 线程 daemon 池）异步重建；
   - 完全未命中（冷启动或被删）走另一条分支：同样用 SETNX 只放一个线程回源，其余线程等 60ms 后重读缓存，读不到才自己兜底回源。
 - **关键类**：`RedisCacheClient`、`ActivityService.detail / detailForSeckill`、`ActivityCacheVO`。
-- **实测口径**：缓存被删后 100 并发查详情，全部成功返回，且只触发 **1 次**异步重建、回源计数为 1；冷启动场景 100 并发请求只回源数据库 **1 次**（加互斥之前是 100 次）。
+- **实测口径**：缓存被删后 100 并发查详情，全部成功返回、回源数据库 **1 次**、100 个请求总耗时 **114 ms**（加互斥/等待重读之前是回源 100 次）；逻辑过期瞬间 100 并发全部成功，只触发 **1 次**异步重建，100 个请求总耗时 **119 ms**。
 - **边界**：异步重建是"尽力而为"——重建失败只打日志，不影响本次请求返回旧值；重建期间返回的是旧数据，所以**活动详情里有"剩余库存"这种秒级变化的字段时不能放进这个缓存**（见第 7 节）。
 
 ### 技术点 4：空值缓存防穿透
@@ -138,7 +138,7 @@
 - **痛点**："先更库再更缓存"在并发下会出现"后写的旧值覆盖先写的新值"；"先删缓存再更库"在读写并发下会出现"读请求把旧值回填进缓存"；删缓存这条网络调用本身还可能失败。
 - **方案**：`CacheEvictService` 四层递进：
   1. **Cache Aside**：先更新数据库，再删缓存（`ActivityService.update` 调 `evictWithCompensation`）；删而不是更新，下一次读自然会回源拿到新值；
-  2. **失败补偿**：`evict` 返回 false 时，往 `cache_sync_task` 落一条 `PENDING` 记录，并投递 `topic_cache_evict`（reason=`UPDATE`）让 `CacheEvictConsumer` 重试删除，成功后把任务置为 `SUCCESS`；
+  2. **失败补偿**：`evict` 返回 false 时，往 `cache_sync_task` 落一条 `PENDING` 记录，并投递 `topic_cache_evict`（reason=`UPDATE`）让 `CacheEvictConsumer` 重试删除，成功后把任务置为 `SUCCESS`（回写条件是 `status != SUCCESS`，所以失败过的任务重试成功后也能回到 SUCCESS；每次回写都把 `retry_count` 加一）；
   3. **延迟双删**：无论第一次删除成功与否，都再投一条延迟消息（reason=`DOUBLE_DELETE`），延迟一段时间后再删一次，清掉"读请求在两次删除之间回填的旧值"；
   4. **TTL 兜底**：即使补偿和双删全部失败，缓存 key 的物理 TTL 最长也就是逻辑 TTL 的 3 倍（默认 60×3 = 180 秒），到期自动消失，最终仍然一致。
 - **关键类**：`CacheEvictService`、`CacheEvictConsumer`、`CacheSyncTask` / `CacheSyncTaskMapper`、`RedisCacheClient.evict`、`MqTopics.CACHE_EVICT`。
@@ -155,7 +155,7 @@
   - **降级**：Redis 抛异常时直接放行（`tryAcquire` catch 后 return true）——限流是保护手段，不能因为限流组件自己挂了把业务熔断。
 - **使用点**：`SeckillController.seckill`（USER，1 秒 5 次）、`OrderController.pay`（USER，1 秒 3 次）、`AuthController.login`（IP，1 秒 20 次）。
 - **关键类**：`SlidingWindowLimit`、`SlidingWindowAspect`、`SlidingWindowLimiter`、`lua/sliding_window.lua`。
-- **实测口径**：同一用户 1 秒内并发 10 次抢购，正好放行 **5** 次（配置 `maxRequests=5`）、其余返回 HTTP 429；改成每 1.2 秒 1 次匀速请求 5 次，**5/5 全部通过** —— 滑动窗口只拦突发，不拦匀速。
+- **实测口径**：同一用户 1 秒内并发 10 次抢购 → **5 次通过 + 5 次 HTTP 429**（配置 `maxRequests=5`）；改成每 1.2 秒 1 次匀速请求，**全部通过、429 为 0** —— 滑动窗口只拦突发，不拦匀速。登录的 IP 维度同样实测过：并发 30 次登录 → **通过 20 次 + 限流 10 次**（阈值 20 次/秒），说明 IP 身份是按真实来源 IP 分桶的（`SlidingWindowAspect` 对未登录接口从当前 HTTP 请求取 IP），而不是所有登录请求共用一个桶。
 
 ### 技术点 7：RocketMQ 延迟消息超时关单 + 库存回滚 + 状态条件更新
 
@@ -164,10 +164,10 @@
   - 下单成功后，`OrderCreateConsumer` 立即投递 `topic_order_timeout`；延迟档位由 `MqProducer.nearestDelayLevel(orderService.timeoutSeconds())` 计算 —— RocketMQ 只支持固定档位（`DELAY_LEVEL_SECONDS`：1s/5s/10s/30s/1m…），30 秒对应 level 4；
   - `OrderTimeoutConsumer` 消费到点后调 `OrderService.timeoutOrder(orderNo)`；
   - 关单 SQL `SeckillOrderMapper.timeoutIfPending`：`WHERE order_no = ? AND status = 'PENDING_PAY'`，受影响行数为 0 说明订单已经支付或已被关过，**直接跳过、不回滚库存**；
-  - 只有关单成功才做双端回滚：`FlashActivityMapper.increaseStock`（`WHERE available_stock < total_stock` 防止回滚超过总库存）+ `SeckillStockService.rollbackStock`（Redis `INCR`）；
+  - 只有关单成功才做双端回滚：`FlashActivityMapper.increaseStock`（`WHERE available_stock < total_stock` 防止回滚超过总库存）+ `SeckillStockService.rollbackStock`（Redis 走 `lua/rollback_stock.lua`：只有当前库存小于 `seckill:total:{id}` 时才 +1，避免在途的关单消息把库存加超总量）；
   - 支付侧 `SeckillOrderMapper.payWithVersion`：`WHERE order_no = ? AND status = 'PENDING_PAY' AND version = ?` 且 `version = version + 1`，这就是"乐观锁"落点 —— 读到的 version 在写回时已经被别人改过，更新就会失败，避免"支付回调与关单互相覆盖"。
 - **关键类**：`OrderCreateConsumer`、`OrderTimeoutConsumer`、`OrderService`、`SeckillOrderMapper`、`FlashActivityMapper`、`MqProducer`。
-- **实测口径**：延迟 **30 秒**的消息到点后关单成功、Redis 与数据库库存各回滚 +1，订单状态分布为 `PAID:1 / TIMEOUT:1`（一笔支付成功、一笔超时关单，两条路径互不干扰）。关单后同一用户再抢会被"每人限购 1 件"拦下 —— 这是设计如此，见第 11 节 FAQ 第 9 条。
+- **实测口径**：延迟 **30 秒**的消息到点后关单成功（轮询在 **22 ms** 内就看到订单从 `PENDING_PAY` 变成 `TIMEOUT`）、Redis 与数据库库存**各回滚 +1**，订单状态分布为 `PAID:1 / TIMEOUT:1`（一笔支付成功、一笔超时关单，两条路径互不干扰）。关单后同一用户再抢会被"每人限购 1 件"拦下 —— 这是设计如此，见第 11 节 FAQ 第 9 条。
 
 ## 7. 数据模型（核心表与关键索引）
 
@@ -177,10 +177,10 @@
 | --- | --- | --- | --- |
 | `sys_user` | phone, password(BCrypt), nickname, role, status, deleted | `uk_phone` | 手机号即登录名，唯一索引把"重复注册"交给数据库而不是"先查再插"的应用逻辑 |
 | `product` | merchant_id, title, description, origin_price(分), cover_color, status | `idx_merchant` | `cover_color` 是演示替代品：用色块代替商品图，省掉对象存储依赖；按商家查列表走索引 |
-| `flash_activity` | product_id, merchant_id, flash_price, total_stock, available_stock, limit_per_user, start_time, end_time, status, version | `idx_product`、`idx_merchant`、`idx_time(start_time,end_time)` | `idx_time` 服务"活动列表按开始时间排序"；`available_stock` 是数据库侧剩余库存，由消费者异步回写；`version` 为活动编辑预留 |
+| `flash_activity` | product_id, merchant_id, flash_price, total_stock, available_stock, limit_per_user, start_time, end_time, status, version | `idx_product`、`idx_merchant`、`idx_time(start_time,end_time)` | `idx_time` 服务"活动列表按开始时间排序"；`available_stock` 是数据库侧剩余库存，由消费者异步回写；`version` 是活动表的乐观锁版本号，由 `MybatisPlusConfig` 注册的 `OptimisticLockerInnerInterceptor` 生效（商家并发改活动时只有一个能改成功） |
 | `seckill_order` | order_no, user_id, activity_id, product_id, flash_price, status, pay_trade_no, pay_time, cancel_time, cancel_reason, version | `uk_order_no`、**`uk_user_activity(user_id, activity_id)`**、`idx_user_status`、`idx_activity` | `uk_order_no` 是对外业务主键；**`uk_user_activity` 是"一人一单"的最后一道防线**——即使 Redis 判断全部失效，数据库也不可能落下同一用户的第二单；`idx_user_status` 服务"我的订单"，`idx_activity` 服务商家查活动订单 |
 | `mq_consume_log` | msg_id, topic, biz_key, status, retry_count, error_msg | **`uk_msg_id`**、`idx_status` | 插入成功 = 首次消费，冲突 = 重复消息；`status` 区分 CONSUMING/SUCCESS/FAILED，FAILED 的消息允许重试 |
-| `cache_sync_task` | cache_key, status, retry_count, error_msg | `idx_status` | 删缓存失败时的落库凭据；消费者按 `status = PENDING` 回写结果 |
+| `cache_sync_task` | cache_key, status, retry_count, error_msg | `idx_status` | 删缓存失败时的落库凭据；消费者按 `status != SUCCESS` 回写结果，并把 `retry_count` 累加 |
 
 三个容易踩的点，代码里都做了处理：
 
@@ -226,7 +226,7 @@
        │◄── PENDING_PAY / PAID / TIMEOUT ──────────────────────────────────────────────────────────────────┤
        │    (实测：接口返回后约 157ms 订单落库)   order 为 null 时返回 state=QUEUING                        │
 
-失败分支：数据库库存不足（`decreaseStock` 返回 0）或落库异常 → 消费者 `catch` 里先 `stockService.rollbackAll` 把 Redis 库存与该用户的已购记录一起还回去，标记 `mq_consume_log` 为 FAILED，再抛异常交给 RocketMQ 阶梯重试。
+失败分支：数据库库存扣不动（`decreaseStock` 返回 0，`OrderService.createOrder` 抛的是「数据库库存已扣不动，本次下单失败」——文案只描述数据库这一侧，**Redis 侧的回滚由消费者完成**）或落库异常 → 消费者 `catch` 里先 `rollbackOnce(msgId, event)`（`seckill:rollback:{msgId}` 的 SETNX 保证每条消息只回滚一次，内部调 `stockService.rollbackAll`）把 Redis 库存与该用户的已购记录一起还回去，标记 `mq_consume_log` 为 FAILED，再抛异常交给 RocketMQ 阶梯重试。
 
 ### 8.2 超时关单（延迟消息 → 条件更新 → 双端回滚）
 
@@ -251,7 +251,7 @@
           │                      │                     │  available_stock + 1                 │              │
           │                      │                     │  (WHERE available_stock < total_stock)│             │
           │                      │                     ├─────────────────────────────────────────────────────►│
-          │                      │                     │  INCR seckill:stock:{id}             │              │
+          │                      │                     │  +1（仅当 < seckill:total:{id}）     │              │
           │                      │                     │  × 不回滚 seckill:bought:{id} 的已购记录              │
           │                      │                     markSuccess(msgId)                     │              │
 
@@ -275,10 +275,10 @@
        │                   │                  │              │               │              ├─────────────►│ 重试 DEL ───►│
        │                   │                  │              │               │              │              │ 成功→任务置 SUCCESS
        │                   │                  │              │               │              │              │              │
-       │                   │                  │              │  无论成败 ────►│ ──DOUBLE_DELETE 延迟消息(最小档 1s)──►│
-       │                   │                  │              │               │              ├─────────────►│ 1 秒后再 DEL ►│
+       │                   │                  │              │  无论成败 ────►│ ──DOUBLE_DELETE 延迟消息(5 秒档)──►│
+       │                   │                  │              │               │              ├─────────────►│ 5 秒后再 DEL ►│
        │                   │                  │              │               │              │              │              │
-       │                   │                  │ ③ prepareStock 重新预热库存   │              │              │              │
+       │                   │                  │ ③ stockService.reset 覆盖库存 │              │              │              │
        │                   │                  ├─ SET seckill:stock:{id} ─────────────────────────────────────────────────►│
        │                   │                  │              │               │              │              │              │
        │◄── 200 OK ────────┤                  │              │               │              │              │              │
@@ -289,19 +289,19 @@
 
 统一响应体 `R<T>`：成功 `{"code":0,"message":"success","data":{...}}`；业务失败 `code` 为 400/401/403/429/500，其中**只有 429 会把 HTTP 状态码也置为 429**（`GlobalExceptionHandler.handleBiz`），其余业务异常 HTTP 仍为 200、由前端按 `code != 0` 处理。登录拦截器拒绝时直接返回 HTTP 401。
 
-鉴权规则见 `WebConfig#addInterceptors`：拦截 `/api/**`，放行 `/api/auth/**`、`/doc.html`、`/webjars/**`、`/v3/api-docs/**`。**除注册登录外的所有接口都需要请求头 `Authorization: Bearer <token>`**。
+鉴权规则见 `WebConfig#addInterceptors`：拦截 `/api/**`，放行 `/api/auth/**`、`/doc.html`、`/webjars/**`、`/v3/api-docs/**`。**除注册登录外的所有接口都需要请求头 `Authorization: Bearer <token>`**。另外 `/api/merchant/**` 在拦截器之后还会统一校验 `role == MERCHANT`（`MerchantController.requireMerchant`），买家 token 调用返回 403「只有商家账号可以执行该操作」——前端的路由拦截只是体验层，挡不住直接调接口。
 
 | 方法 | 路径 | 说明 | 限流 | 代码落点 |
 | --- | --- | --- | --- | --- |
 | POST | `/api/auth/register` | 注册（role 默认 BUYER，可传 MERCHANT） | — | `AuthController.register` |
-| POST | `/api/auth/login` | 登录：签发 JWT + 会话写 Redis（24h，拦截器滑动续期） | IP 维度 1 秒 20 次 | `AuthController.login` |
+| POST | `/api/auth/login` | 登录：签发 JWT + 会话写 Redis（24h，拦截器滑动续期） | IP 维度 1 秒 20 次（实测 30 并发 → 20 通过 + 10 个 429） | `AuthController.login` |
 | GET | `/api/activity/list?keyword=` | 抢购活动列表（status=1，按 start_time 升序，limit 30） | — | `ActivityController.list` |
 | GET | `/api/activity/{id}` | 活动详情（逻辑过期缓存 + 剩余库存实时读 Redis + serverTime 供前端校时） | — | `ActivityController.detail` |
 | GET | `/api/product/list` | 在售商品列表（status=1，limit 50） | — | `ProductController.list` |
 | POST | `/api/seckill/{activityId}` | 抢购：返回 `{orderNo, state:"QUEUING", message}` | USER 维度 1 秒 5 次 | `SeckillController.seckill` |
 | GET | `/api/seckill/result/{orderNo}` | 轮询抢购结果（order 未落库时返回 `state=QUEUING`） | — | `SeckillController.result` |
 | GET | `/api/order/mine` | 我的订单（按创建时间倒序，limit 50） | — | `OrderController.mine` |
-| GET | `/api/order/{orderNo}` | 订单详情（含 `payDeadline` 支付截止时间） | — | `OrderController.detail` |
+| GET | `/api/order/{orderNo}` | 订单详情（含 `payDeadline` 支付截止时间；**校验归属**：非本人 403「无权查看该订单」，订单不存在 404「订单不存在或还在生成中，请稍后重试」） | — | `OrderController.detail` |
 | POST | `/api/order/{orderNo}/pay` | 支付（模拟支付网关回调，乐观锁状态流转，重复支付幂等返回） | USER 维度 1 秒 3 次 | `OrderController.pay` |
 | POST | `/api/merchant/product` | 创建商品 | — | `MerchantController.createProduct` |
 | GET | `/api/merchant/product/mine` | 我店铺的商品 | — | `MerchantController.myProducts` |
@@ -334,7 +334,7 @@
 | 布隆过滤器 | 空值缓存在本项目的数据规模下已经够用 | `NULL_MARK` 空值缓存（TTL 30 秒）；随机 id 攻击仍会穿透，属于已知边界 |
 | 分布式锁 | 本项目的所有竞态都能用"原子脚本 + 唯一索引 + 条件更新"解决，引入 Redisson 只会多一个需要运维的组件 | Lua 原子脚本、`SETNX` 互斥（缓存重建）、数据库条件更新 |
 | 对象存储（MinIO 等） | 商品图不是本项目的技术重点 | `product.cover_color` 色块，前端直接渲染颜色 |
-| 死信监控与重放 | 当前只有 `%DLQ%cg_order_create` 这个常量（`MqTopics.DLQ_ORDER_CREATE`），没有消费者与后台接口 | 消费失败先走 RocketMQ 阶梯重试；超过重试次数后进死信，目前只能去 Dashboard 人工处理，属于待补项 |
+| 死信监控与重放 | 消费失败重试到上限后，消息会进 RocketMQ 按消费组自动创建的死信主题 `%DLQ%cg_order_create`；但项目里**没有对应的消费者与重放接口**（`MqTopics` 里连常量都没有，曾经的 `DLQ_ORDER_CREATE` 已作为死代码删掉） | 消费失败先走 RocketMQ 阶梯重试；超过重试次数后进死信，只能去 Dashboard 人工处理，属于待补项 |
 | 管理后台 / 运营台 | 角色只有买家与商家 | 商家工作台（`/merchant` 路由 + `MerchantController`）已覆盖商品与活动维护 |
 
 ## 11. 设计决策与取舍记录（FAQ）
@@ -368,7 +368,7 @@
 **6. 为什么还要延迟双删？**
 结论：为了清掉"读写并发时被回填的旧值"。
 理由：Cache Aside 有一个已知的失效窗口：读请求在"数据库更新之后、缓存删除之前"读到旧数据，然后在"缓存删除之后"才把旧值写回缓存 —— 这条旧值会一直留在缓存里直到 TTL 到期。延迟一小段时间再删一次，就能把这个窗口关掉。
-边界：延迟双删**降低**这个窗口的概率，并不严格消除，所以还叠加了 TTL 兜底（物理 TTL = 逻辑 TTL × 3）。另外延迟时间受 RocketMQ 延迟档位限制：RocketMQ 只支持固定档位，最小是 1 秒，所以配置项 `flashmart.cache.double-delete-delay-millis: 500` 经过 `Math.max(1, 500/1000)` 之后实际是 **1 秒**，配置里的毫秒值当前只有向下取整到秒的意义。要真正的亚秒级延迟，得改造成时间轮或本地延迟队列。
+边界：延迟双删**降低**这个窗口的概率，并不严格消除，所以还叠加了 TTL 兜底（物理 TTL = 逻辑 TTL × 3）。延迟时间直接按秒配：`flashmart.cache.double-delete-delay-seconds: 5`，经 `nearestDelayLevel(5)` 落到 RocketMQ 的第 2 档，**实际生效就是 5 秒**（早先是 `double-delete-delay-millis: 500`，代码里还要 `Math.max(1, 毫秒/1000)` 折算，配了也看不出实际值）。RocketMQ 只支持固定档位，要真正的亚秒级延迟，得改造成时间轮或本地延迟队列。
 
 **7. 为什么用延迟消息，不用定时任务扫表？**
 结论：定时任务扫全表在订单量大时是灾难，延迟消息是"一条订单一个精确闹钟"。
@@ -382,8 +382,8 @@
 
 **9. 为什么超时关单只回滚库存，不回滚"已购记录"？**
 结论：名额是一次性的机会，不付款就作废；库存退回池子给其他人抢。
-理由：如果关单时把 `seckill:bought:{id}` 里该用户的记录也清掉，用户可以"抢了不付 → 关单 → 再抢"，把库存反复占住，这等于给恶意用户一个零成本锁库存的手段。真实秒杀业务也是这个口径：`OrderService.timeoutOrder` 只调 `rollbackStock`（Redis `INCR`）+ `activityMapper.increaseStock`（数据库 +1），**不调** `clearUserRecord`。
-边界：用户确实会"莫名其妙被限购"，需要在产品上给出文案（本项目返回"每人限购 1 件，你已经抢到啦"）。`SeckillStockService.clearUserRecord` 这个方法已经写好但**当前没有任何调用方** —— 它是留给"客服手动释放名额"这类后台操作的。
+理由：如果关单时把 `seckill:bought:{id}` 里该用户的记录也清掉，用户可以"抢了不付 → 关单 → 再抢"，把库存反复占住，这等于给恶意用户一个零成本锁库存的手段。真实秒杀业务也是这个口径：`OrderService.timeoutOrder` 只调 `rollbackStock`（Redis 侧 +1，走带上限的 `lua/rollback_stock.lua`）+ `activityMapper.increaseStock`（数据库 +1），**不动** `seckill:bought:{id}` 里的已购记录（项目里也没有 `clearUserRecord` 这类方法了，已作为死代码删除）。
+边界：用户确实会"莫名其妙被限购"，需要在产品上给出文案（本项目返回"每人限购 1 件，你已经抢到啦"）。"客服手动释放名额"这类后台操作**当前没有对应代码**——曾经写过一个 `SeckillStockService.clearUserRecord`，因为始终没有调用方，已经作为死代码删掉了；要做就得重新实现。
 对照：下单**失败**（数据库库存不足、落库异常）走的是 `rollbackAll`，库存与已购记录**一起**回滚 —— 因为用户什么都没拿到，得把机会还给他。
 
 **10. 为什么 Redis 扣减在前、数据库扣减在消费端？**
@@ -397,9 +397,9 @@
 边界：Redis 单节点部署，没有任何高可用方案（没有哨兵、没有集群），属于待补项。
 
 **12. 消息发送失败了怎么办？**
-结论：当前是"记日志 + 依赖 RocketMQ 客户端自身重试"，没有本地消息表。
-理由：`MqProducer.sendAsync` 的 `onException` 只打了 `log.error`，`sendAsync` 外层还有一层 try-catch 打日志；生产者配了 `retry-times-when-send-failed: 3` 与 `send-message-timeout: 3000`。Broker 侧接收成功后，消费失败有阶梯重试兜底。
-边界：**"消息最终没发出去"这个场景当前会丢单** —— 用户已经看到"抢到了"（Redis 库存已扣），但订单永远不会落库，也没有补偿。正确做法是本地消息表（业务事务里落一条待发消息，再由后台任务投递）或 RocketMQ 事务消息，本项目**明确未做**，记录在待补清单里。异步发送的选择本身也意味着主链路不等 broker 回执。
+结论：当前是"异步发送失败后同步重发一次 + 记日志"，仍然没有本地消息表。
+理由：`MqProducer.sendAsync` 的 `onException` 里会调 `syncResend` **同步重发一次**（同步发送会走客户端自身的 `retry-times-when-send-failed: 3` 与 `send-message-timeout: 3000`），只有同步重发也失败才打 `log.error`；`sendAsync` 外层还有一层 try-catch 打日志。Broker 侧接收成功后，消费失败有阶梯重试兜底。
+边界：**同步重发也失败时，"消息最终没发出去"这个场景仍会丢单** —— 用户已经看到"抢到了"（Redis 库存已扣），但订单永远不会落库，也没有补偿。正确做法是本地消息表（业务事务里落一条待发消息，再由后台任务投递）或 RocketMQ 事务消息，本项目**明确未做**，记录在待补清单里。异步发送的选择本身也意味着主链路不等 broker 回执。
 
 **13. 为什么数据库要有 `uk_user_activity`，Redis 不是已经拦住了吗？**
 结论：唯一索引是"最后一道防线"，它保证的是不可能，而不是"概率很低"。
