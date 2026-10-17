@@ -34,6 +34,7 @@ public class SeckillService {
     private final ActivityService activityService;
     private final SeckillStockService stockService;
     private final OrderService orderService;
+    private final OrderStateNotifier stateNotifier;
     private final MqProducer mqProducer;
 
     public Map<String, Object> seckill(Long activityId) {
@@ -80,23 +81,51 @@ public class SeckillService {
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("orderNo", orderNo);
         response.put("state", "QUEUING");
-        response.put("message", "抢到了！正在为你生成订单");
+        // 不做过早承诺：此刻只是"库存扣到了"，订单还没落库
+        response.put("message", "抢购资格已锁定，正在为你生成订单");
         return response;
     }
 
-    /** 轮询抢购结果：订单还没落库时返回 QUEUING，前端据此显示"排队中" */
+    /**
+     * 轮询抢购结果。
+     *
+     * <p>可能的 state：
+     * <ul>
+     *   <li>QUEUING：订单还没落库，正常排队中；</li>
+     *   <li>RETRYING：这一轮处理失败、MQ 正在重试（中间态）；</li>
+     *   <li>FAILED：确定失败，<b>名额与库存已退回，可以再抢</b>；</li>
+     *   <li>PENDING_PAY / PAID / TIMEOUT / CANCELLED：订单落库后的真实状态。</li>
+     * </ul>
+     */
     public Map<String, Object> result(String orderNo) {
         Long userId = requireUserId();
         SeckillOrder order = orderService.findByOrderNo(orderNo);
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("orderNo", orderNo);
         if (order == null) {
+            // 订单不存在时先看过程标记：否则用户只会看到"排队中"，一直干等、也不知道名额已经退回
+            String failedReason = stateNotifier.failedReason(orderNo);
+            if (failedReason != null) {
+                response.put("state", "FAILED");
+                response.put("message", failedReason);
+                response.put("retryable", true);
+                return response;
+            }
+            String retryingReason = stateNotifier.retryingReason(orderNo);
+            if (retryingReason != null) {
+                response.put("state", "RETRYING");
+                response.put("message", retryingReason);
+                return response;
+            }
             response.put("state", "QUEUING");
             return response;
         }
         if (!userId.equals(order.getUserId())) {
             throw new BizException(403, "无权查看该订单");
         }
+        // 订单已经落库且确认是本人：清理过程标记，避免残留
+        // （注意顺序：先校验归属再清理，否则别人拿你的订单号来查就能把你的标记清掉）
+        stateNotifier.markSucceeded(orderNo);
         response.put("state", order.getStatus());
         response.put("order", orderService.toVO(order));
         return response;

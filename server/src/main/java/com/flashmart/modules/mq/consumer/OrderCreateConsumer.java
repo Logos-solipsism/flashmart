@@ -9,6 +9,7 @@ import com.flashmart.common.trace.TraceIdFilter;
 import com.flashmart.common.trace.TraceUtil;
 import com.flashmart.modules.order.entity.SeckillOrder;
 import com.flashmart.modules.order.service.OrderService;
+import com.flashmart.modules.seckill.service.OrderStateNotifier;
 import com.flashmart.modules.seckill.service.SeckillStockService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -37,6 +38,7 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
     private final MqIdempotentRepository idempotentRepository;
     private final OrderService orderService;
     private final SeckillStockService stockService;
+    private final OrderStateNotifier stateNotifier;
     private final MqProducer mqProducer;
     private final StringRedisTemplate redis;
 
@@ -66,8 +68,10 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
             SeckillOrder order = orderService.createOrder(event.orderNo(), event.userId(),
                     event.activityId(), event.productId(), event.flashPrice());
             if (order == null) {
-                // 重复下单：唯一索引已拦下，Redis 侧把这次预扣的库存与机会都还回去
+                // 重复下单：唯一索引已拦下，Redis 侧把这次预扣的库存与机会都还回去。
+                // 这是"确定失败"：要留痕，否则用户拿 orderNo 轮询只会一直看到"排队中"，干等到超时。
                 rollbackOnce(msgId, event);
+                stateNotifier.markFailed(event.orderNo(), "本次未能生成订单（你已抢到过该活动），名额已退回，可稍后再试");
                 idempotentRepository.markSuccess(msgId);
                 return;
             }
@@ -76,12 +80,20 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
                     new MqEvents.OrderTimeoutEvent(event.orderNo()),
                     MqProducer.nearestDelayLevel(orderService.timeoutSeconds()));
             idempotentRepository.markSuccess(msgId);
+            // 订单落库成功，清掉过程中的"重试中/失败"标记
+            stateNotifier.markSucceeded(event.orderNo());
             log.info("订单创建成功 orderNo={}, userId={}, activityId={}",
                     event.orderNo(), event.userId(), event.activityId());
         } catch (Exception e) {
-            // 数据库库存不足等异常：回滚 Redis 预扣的库存与机会，再抛出去让 MQ 重试 / 进死信
+            // 数据库库存扣不动等异常：回滚 Redis 预扣的库存与机会，再抛出去让 MQ 重试 / 进死信
             rollbackOnce(msgId, event);
             idempotentRepository.markFailed(msgId, e.getMessage());
+            // 留痕区分"还会重试"和"已经放弃"：RocketMQ 重试到第 3 次以后，就让前端明确告诉用户失败
+            if (message.getReconsumeTimes() >= 2) {
+                stateNotifier.markFailed(event.orderNo(), "本次未能生成订单，名额已退回，可稍后再试");
+            } else {
+                stateNotifier.markRetrying(event.orderNo(), "订单生成遇到波动，正在重试");
+            }
             throw new RuntimeException(e);
         }
     }

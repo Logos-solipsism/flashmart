@@ -32,6 +32,7 @@ const actionError = ref('') // 抢购/支付失败提示（后端原文）
 const actionTip = ref('')
 const paying = ref(false)
 const pollTimedOut = ref(false) // 轮询超时（订单还在队列里）
+const canRetry = ref(false) // 后端明确告知"本次失败、名额已退回"，可以再抢
 
 // 倒计时：以服务端时间为准，避免前端时钟不准
 const serverOffset = ref(0)
@@ -154,13 +155,15 @@ async function doSeckill() {
   orderNo.value = ''
   queued.value = false
   pollTimedOut.value = false
+  canRetry.value = false
   seckilling.value = true
 
   try {
     const data = await request('/seckill/' + detail.value.id, { method: 'POST' })
     orderNo.value = data.orderNo
     queued.value = true
-    actionTip.value = data.message || '抢到了！正在为你生成订单'
+    // 不做过早承诺：这时只是"库存扣到了"，订单还没落库
+    actionTip.value = data.message || '抢购资格已锁定，正在为你生成订单'
     startPolling()
   } catch (e) {
     // 限流 / 限购 / 抢光 / 未开始 / 已结束：原样展示后端提示
@@ -191,6 +194,22 @@ function startPolling() {
     try {
       const data = await request('/seckill/result/' + orderNo.value)
       if (data.state === 'QUEUING') {
+        return
+      }
+      // 还在重试：保持"排队中"的界面，但换成更准确的提示，继续轮询
+      if (data.state === 'RETRYING') {
+        actionTip.value = data.message || '订单生成遇到波动，正在重试'
+        return
+      }
+      // 明确失败：停轮询，告诉用户名额已经退回、可以再抢（不要让他干等到超时）
+      if (data.state === 'FAILED') {
+        stopPolling()
+        seckilling.value = false
+        queued.value = false
+        canRetry.value = data.retryable !== false
+        actionTip.value = ''
+        actionError.value = data.message || '本次未能抢到，名额已退回，可以再试一次'
+        loadDetail()
         return
       }
       // 已经落库，停止轮询
@@ -330,6 +349,14 @@ async function pay() {
           >
             {{ buyText }}
           </button>
+
+          <!-- 后端明确告知"本次失败、名额已退回"：给一个显而易见的重试入口，别让用户干等到超时 -->
+          <div v-if="canRetry" class="mt-12 flex gap-12">
+            <button class="btn btn-danger" type="button" :disabled="buyDisabled" @click="doSeckill">
+              再抢一次
+            </button>
+            <button class="btn" type="button" @click="router.push('/orders')">查看我的订单</button>
+          </div>
 
           <div v-if="pollTimedOut" class="mt-12">
             <button class="btn" type="button" @click="router.push('/orders')">查看我的订单</button>
