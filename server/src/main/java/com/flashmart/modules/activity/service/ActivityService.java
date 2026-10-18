@@ -153,10 +153,18 @@ public class ActivityService {
         if (activity == null || !merchantId.equals(activity.getMerchantId())) {
             throw new BizException(403, "无权修改该活动");
         }
-        activity.setTotalStock(totalStock);
-        // 已售出数量保持不变：可用库存 = 新总库存 - 已售
+        // ⚠️ 顺序很关键：必须【先用数据库里的原值】算出已售，再去覆盖 totalStock。
+        // 之前我写成了先 setTotalStock(totalStock)、再算 sold，结果
+        // sold 变成了"新总库存 − 原可用库存"，可用库存被算成原值不变 ——
+        // 等于把"少掉的 20 件"当成没卖出去，直接超卖。
         int sold = activity.getTotalStock() - activity.getAvailableStock();
-        activity.setAvailableStock(Math.max(0, totalStock - sold));
+        if (totalStock < sold) {
+            // 商家改小到比已售还少，是不合理操作：直接拒绝，别偷偷钳成 0 让他以为改成功了
+            throw new BizException("新总库存（" + totalStock + "）不能小于已售出的 " + sold + " 件");
+        }
+        activity.setTotalStock(totalStock);
+        // 已售是既成事实，不能被抹掉：可用库存 = 新总库存 − 已售
+        activity.setAvailableStock(totalStock - sold);
         activity.setStartTime(startTime);
         activity.setEndTime(endTime);
         activity.setUpdateTime(LocalDateTime.now());
