@@ -163,8 +163,10 @@ public class ActivityService {
         activityMapper.updateById(activity);
 
         cacheEvictService.evictWithCompensation(ActivityCacheKeys.detail(activityId));
-        // 用 reset 强制覆盖：预热带 10 秒 SETNX 互斥，商家 10 秒内连改两次的话第二次不会生效
-        stockService.reset(activityId, activity.getAvailableStock(), activity.getTotalStock());
+        // 用 resetStock 强制覆盖：预热带 10 秒 SETNX 互斥，商家 10 秒内连改两次的话第二次不会生效。
+        // 注意用的是 resetStock 而不是 reset —— 后者会连"已购记录"一起清掉，
+        // 那等于把别人已经抢到的记录抹掉、一人一单被绕过（只有压测清场才需要那个语义）
+        stockService.resetStock(activityId, activity.getAvailableStock(), activity.getTotalStock());
     }
 
     /** 把库存写进 Redis（幂等：同一个活动只初始化一次，避免并发覆盖已扣减的库存） */

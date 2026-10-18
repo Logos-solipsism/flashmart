@@ -76,12 +76,31 @@ public class SeckillStockService {
         }
     }
 
-    /** 强制覆盖库存（商家改活动、压测前重置场景） */
-    public void reset(Long activityId, int availableStock, int totalStock) {
+    /**
+     * 强制覆盖库存（商家改活动时用）：直接把库存与总库存上限写成新值。
+     *
+     * <p>为什么不能用 {@link #ensurePrepared}（预热）：预热带 10 秒的 SETNX 互斥，
+     * 它的语义是"没有才写一次"。商家 10 秒内连改两次库存时，第二次拿不到锁、什么都不做，
+     * 于是数据库改了、Redis 还是上一次的值 —— 抢购仍按旧数字扣。
+     *
+     * <p><b>注意：这里绝对不能清"已购记录"</b>（seckill:bought:{id}）。
+     * 已购记录代表"谁已经抢到过"，是既成事实；商家改库存不该把别人的购买记录抹掉，
+     * 否则一人一单的判定会被绕过（用户能再抢一次，最后撞数据库唯一索引才失败）。
+     * 只有压测重置（{@link #reset}）才需要连已购记录一起清。
+     */
+    public void resetStock(Long activityId, int availableStock, int totalStock) {
         redis.opsForValue().set(ActivityCacheKeys.stock(activityId),
                 String.valueOf(availableStock), Duration.ofDays(7));
         redis.opsForValue().set(ActivityCacheKeys.total(activityId),
                 String.valueOf(totalStock), Duration.ofDays(7));
+    }
+
+    /**
+     * 彻底重置（压测清场专用）：库存、总库存上限、**已购记录**一起清空，
+     * 让同一批用户能重新抢。业务代码不要调它。
+     */
+    public void reset(Long activityId, int availableStock, int totalStock) {
+        resetStock(activityId, availableStock, totalStock);
         redis.delete(ActivityCacheKeys.bought(activityId));
     }
 
