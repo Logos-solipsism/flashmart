@@ -6,6 +6,7 @@ import com.flashmart.common.exception.BizException;
 import com.flashmart.modules.activity.entity.FlashActivity;
 import com.flashmart.modules.activity.mapper.FlashActivityMapper;
 import com.flashmart.modules.order.entity.SeckillOrder;
+import com.flashmart.modules.order.exception.PriceChangedException;
 import com.flashmart.modules.order.mapper.SeckillOrderMapper;
 import com.flashmart.modules.product.entity.Product;
 import com.flashmart.modules.product.mapper.ProductMapper;
@@ -52,10 +53,25 @@ public class OrderService {
     /**
      * 创建订单（MQ 消费者调用）。
      *
+     * <p>第 0 步是<b>用数据库的当前价格校验一次</b>：抢购时用户看到的价格来自缓存，
+     * 而"改活动后删缓存"是有可能失败的（删缓存失败会走补偿，但补偿也可能失败），
+     * 那个窗口里就会出现"按旧价成交"。原则是——<b>缓存只负责展示，成交前必须回权威源校验</b>。
+     * 校验放在这里而不是抢购接口，是因为消费者本来就要访问数据库，而抢购接口的原则是不碰数据库。
+     *
      * @return 创建成功的订单；返回 null 表示这单是重复的，已按幂等处理
+     * @throws PriceChangedException 当前价格与用户看到的价格不一致（终态失败，不应重试）
      */
     @Transactional(rollbackFor = Exception.class)
     public SeckillOrder createOrder(String orderNo, Long userId, Long activityId, Long productId, Integer flashPrice) {
+        // 0) 用数据库里的当前价格校验：不一致就拒单，避免"展示价 399、成交价 499"这类纠纷
+        FlashActivity current = activityMapper.selectById(activityId);
+        if (current == null) {
+            throw new BizException("活动不存在，本次下单失败");
+        }
+        if (flashPrice == null || !flashPrice.equals(current.getFlashPrice())) {
+            throw new PriceChangedException(flashPrice, current.getFlashPrice());
+        }
+
         // 1) 扣数据库库存：WHERE available_stock > 0 保证数据库这一层也不会扣成负数
         int affected = activityMapper.decreaseStock(activityId);
         if (affected == 0) {

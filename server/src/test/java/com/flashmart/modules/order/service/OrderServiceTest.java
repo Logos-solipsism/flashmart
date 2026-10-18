@@ -6,6 +6,7 @@ import com.flashmart.common.exception.BizException;
 import com.flashmart.modules.activity.entity.FlashActivity;
 import com.flashmart.modules.activity.mapper.FlashActivityMapper;
 import com.flashmart.modules.order.entity.SeckillOrder;
+import com.flashmart.modules.order.exception.PriceChangedException;
 import com.flashmart.modules.order.mapper.SeckillOrderMapper;
 import com.flashmart.modules.product.mapper.ProductMapper;
 import com.flashmart.modules.seckill.service.SeckillStockService;
@@ -26,6 +27,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -62,6 +64,52 @@ class OrderServiceTest {
     @AfterEach
     void clear() {
         UserContext.clear();
+    }
+
+    private FlashActivity activity(Integer flashPrice) {
+        FlashActivity activity = new FlashActivity();
+        activity.setId(9001L);
+        activity.setProductId(9001L);
+        activity.setFlashPrice(flashPrice);
+        activity.setTotalStock(100);
+        activity.setAvailableStock(100);
+        return activity;
+    }
+
+    @Test
+    @DisplayName("下单时价格与数据库一致：正常成交（扣库存 + 插订单）")
+    void createOrderWithSamePrice() {
+        when(activityMapper.selectById(9001L)).thenReturn(activity(39900));
+        when(activityMapper.decreaseStock(9001L)).thenReturn(1);
+
+        SeckillOrder created = newService().createOrder("FM1", 9003L, 9001L, 9001L, 39900);
+
+        org.junit.jupiter.api.Assertions.assertNotNull(created);
+        assertEquals(39900, created.getFlashPrice());
+        verify(orderMapper, times(1)).insert(org.mockito.ArgumentMatchers.any(SeckillOrder.class));
+    }
+
+    @Test
+    @DisplayName("下单时价格已经被改过：拒单，且不动数据库库存、不插订单")
+    void createOrderWithChangedPrice() {
+        // 用户看到 39900，但数据库里已经被商家改成 49900
+        when(activityMapper.selectById(9001L)).thenReturn(activity(49900));
+
+        PriceChangedException error = assertThrows(PriceChangedException.class,
+                () -> newService().createOrder("FM1", 9003L, 9001L, 9001L, 39900));
+
+        assertEquals(39900, error.getSeenPrice());
+        assertEquals(49900, error.getCurrentPrice());
+        verify(activityMapper, never()).decreaseStock(org.mockito.ArgumentMatchers.any());
+        verify(orderMapper, never()).insert(org.mockito.ArgumentMatchers.any(SeckillOrder.class));
+    }
+
+    @Test
+    @DisplayName("活动不存在：拒单，不插订单")
+    void createOrderWithMissingActivity() {
+        when(activityMapper.selectById(9001L)).thenReturn(null);
+        assertThrows(BizException.class, () -> newService().createOrder("FM1", 9003L, 9001L, 9001L, 39900));
+        verify(orderMapper, never()).insert(org.mockito.ArgumentMatchers.any(SeckillOrder.class));
     }
 
     @Test

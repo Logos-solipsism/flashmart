@@ -8,6 +8,7 @@ import com.flashmart.common.mq.MqTopics;
 import com.flashmart.common.trace.TraceIdFilter;
 import com.flashmart.common.trace.TraceUtil;
 import com.flashmart.modules.order.entity.SeckillOrder;
+import com.flashmart.modules.order.exception.PriceChangedException;
 import com.flashmart.modules.order.service.OrderService;
 import com.flashmart.modules.seckill.service.OrderStateNotifier;
 import com.flashmart.modules.seckill.service.SeckillStockService;
@@ -84,6 +85,13 @@ public class OrderCreateConsumer implements RocketMQListener<MessageExt> {
             stateNotifier.markSucceeded(event.orderNo());
             log.info("订单创建成功 orderNo={}, userId={}, activityId={}",
                     event.orderNo(), event.userId(), event.activityId());
+        } catch (PriceChangedException e) {
+            // 价格已变化：这是终态失败 —— 重试一百次价格也不会变回来，
+            // 所以不交给 MQ 重试，直接回滚名额 + 给用户明确提示（让他刷新重看价格再抢）
+            rollbackOnce(msgId, event);
+            stateNotifier.markFailed(event.orderNo(), "价格已变化，名额已退回，请刷新页面后重新抢购");
+            idempotentRepository.markSuccess(msgId);
+            log.warn("下单时价格已变化，已拒单并回滚名额 orderNo={}, {}", event.orderNo(), e.getMessage());
         } catch (Exception e) {
             // 数据库库存扣不动等异常：回滚 Redis 预扣的库存与机会，再抛出去让 MQ 重试 / 进死信
             rollbackOnce(msgId, event);
