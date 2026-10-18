@@ -141,8 +141,10 @@
   2. **失败补偿**：`evict` 返回 false 时，往 `cache_sync_task` 落一条 `PENDING` 记录，并投递 `topic_cache_evict`（reason=`UPDATE`）让 `CacheEvictConsumer` 重试删除，成功后把任务置为 `SUCCESS`（回写条件是 `status != SUCCESS`，所以失败过的任务重试成功后也能回到 SUCCESS；每次回写都把 `retry_count` 加一）；
   3. **延迟双删**：无论第一次删除成功与否，都再投一条延迟消息（reason=`DOUBLE_DELETE`），延迟一段时间后再删一次，清掉"读请求在两次删除之间回填的旧值"；
   4. **TTL 兜底**：即使补偿和双删全部失败，缓存 key 的物理 TTL 最长也就是逻辑 TTL 的 3 倍（默认 60×3 = 180 秒），到期自动消失，最终仍然一致。
-- **关键类**：`CacheEvictService`、`CacheEvictConsumer`、`CacheSyncTask` / `CacheSyncTaskMapper`、`RedisCacheClient.evict`、`MqTopics.CACHE_EVICT`。
+- **一条硬规矩：缓存只负责展示，成交前必须回权威源校验**。抢购时的订单价格来自缓存里的活动详情，而上面 1~4 层只能**减少**"删缓存失败"的窗口、不能消除它——那个窗口里商家已经改价、用户却按旧价成交，会造成纠纷或资损。所以 `OrderService.createOrder` 的第 0 步会从数据库读**当前价格**，与用户看到的价格比对：不一致就抛 `PriceChangedException`（**终态失败**），此时既不扣数据库库存也不插订单；消费者捕获后回滚 Redis 预扣的库存与名额、给前端明确提示"价格已变化，请刷新页面后重新抢购"，并标记消息已处理（**不做 MQ 重试**，因为重试多少次价格都不会变回来）。校验放在消费者侧而不是抢购接口，是因为消费者本来就要访问数据库，而抢购接口的原则是不碰数据库。
+- **关键类**：`CacheEvictService`、`CacheEvictConsumer`、`CacheSyncTask` / `CacheSyncTaskMapper`、`RedisCacheClient.evict`、`MqTopics.CACHE_EVICT`、`OrderService.createOrder`、`PriceChangedException`。
 - **实测口径**：商家修改活动（改库存/时间）后，活动详情接口立刻返回新的标题/时间；`cache_sync_task` 表在正常路径下不产生记录（删除成功即返回），只有 Redis 异常时才会落下 `PENDING`。
+- **单测覆盖**：价格一致 → 正常成交（扣库存 + 插订单）；价格已被改过 → 抛 `PriceChangedException` 且**库存一行都不许扣、订单一条都不许插**；活动不存在 → 拒单。
 
 ### 技术点 6：Redis ZSet + Lua + AOP 注解的滑动窗口限流
 
