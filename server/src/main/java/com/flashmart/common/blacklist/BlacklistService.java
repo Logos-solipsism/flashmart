@@ -73,6 +73,16 @@ public class BlacklistService {
     /**
      * 记一次违规。ip 无效直接返回（不计数，否则无头请求会挤进同一个桶把别人封了）；
      * 达到阈值就封禁并清掉计数，重新开始统计。
+     *
+     * <p><b>参数必须是客户端 IP，不能传用户身份</b>（userId / role / "global" 这类分桶身份）：
+     * 封禁名单只有 {@link #isBanned(String)} 一个读取口，而它的两个调用方
+     * （BlacklistFilter 与压测取证接口）都只用客户端 IP 去查 {@code black:list:{ip}}。
+     * 传身份进来只会写出没人查的死 key，封禁静默失效。
+     *
+     * <p>边界说明：限流是按维度分桶的，但<b>违规一律记在该请求的客户端 IP 上</b>
+     * —— 所以 USER 维度（抢购/支付）被限流时，惩罚落在 IP、不落在账号：同一个 IP 下的其它账号
+     * 也会被一起挡住。账号级封禁要把检查点挪到鉴权之后（按 userId 封、按 userId 查），
+     * 本项目不做这件事；账号维度由 Redis 会话失效（改密码/封号）承担。
      */
     public void recordViolation(String ip) {
         if (!isValidIp(ip)) {

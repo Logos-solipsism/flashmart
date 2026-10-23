@@ -656,7 +656,11 @@ public class Bench {
         return api(call("POST", path, token, null, new String[]{"X-Forwarded-For", xff}));
     }
 
-    /** 带 X-Forwarded-For 的真实抢购（IP 维度 identity 就是伪造出来的那个 IP） */
+    /**
+     * 带 X-Forwarded-For 的真实抢购。
+     * 抢购是 USER 维度分桶（key 用 userId），但被限流时记违规用的是【客户端 IP】——
+     * 所以这里伪造的 XFF 就是最终被封的 IP，和分桶维度无关。
+     */
     static Api sendSeckillFromIp(String token, String xff) {
         return postFromIp("/api/seckill/" + activity, token, xff);
     }
@@ -1773,7 +1777,10 @@ public class Bench {
                         statStr(before, "banned")}
         ));
 
-        // ② 1 秒内 10 个并发：5 个被限流拒绝（每人 1 秒 5 次）→ 违规计数达到阈值 5 → 封禁
+        // ② 1 秒内 10 个并发：5 个被限流拒绝（每人 1 秒 5 次）→ 违规计数达到阈值 5 → 封禁。
+        // 注意：抢购是 USER 维度（分桶 key 用 userId），但切面记违规用的是客户端 IP，
+        // 所以封掉的是伪造出来的 203.0.113.7 这个 IP，不是某个 userId。
+        // 这条前提由单测钉住：SlidingWindowAspectTest#userDimensionRecordsViolationAgainstIpNotUserId
         System.out.println();
         note("第 1 阶段：从 " + attackerIp + " 在 1 秒内并发 10 次抢购（限流窗口每人 5 次/秒）");
         List<Supplier<Api>> tasks = new ArrayList<>();

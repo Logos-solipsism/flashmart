@@ -170,7 +170,10 @@ reset → 抢购 → 轮询到 `PENDING_PAY` → 支付 → **再支付一次**�
 步骤（全部用伪造的 `X-Forwarded-For` 冒充攻击者 IP）：
 1. `POST /api/bench/blacklist/reset` 清黑名单 + 两个取证计数器，reset 活动并等 MQ 排空；
 2. 从 `203.0.113.7` **1 秒内并发 10 次**真实抢购 —— 限流窗口每人 5 次/秒，
-   被拒的那几次各记一次违规，累计到阈值（实验用 5）即封禁 `black:list:203.0.113.7`（TTL 60 秒）；
+   被拒的那几次各记一次违规，累计到阈值（实验用 5）即封禁 `black:list:203.0.113.7`（TTL 60 秒）。
+   注意：抢购是 **USER 维度**分桶（限流 key 用 userId），但**违规一律记在该请求的客户端 IP 上**，
+   所以封掉的是伪造的 IP，与用户身份无关 —— 这条由单测
+   `SlidingWindowAspectTest#userDimensionRecordsViolationAgainstIpNotUserId` 钉住；
 3. 封禁后再从同一 IP 打 10 次：**期望全部 HTTP 429 + code=429**（响应体是黑名单的
    `访问过于频繁，已被临时限制，请稍后再试`，不是限流切面抛的那条），
    且 `limiterCalls`（SlidingWindowLimiter 的 Lua 调用次数）**增量为 0** —— 这就是"没跑 Lua"的证据；

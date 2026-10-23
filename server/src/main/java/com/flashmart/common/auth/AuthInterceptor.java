@@ -1,5 +1,6 @@
 package com.flashmart.common.auth;
 
+import com.flashmart.common.blacklist.ClientIpResolver;
 import com.flashmart.common.context.UserContext;
 import io.jsonwebtoken.Claims;
 import jakarta.servlet.http.HttpServletRequest;
@@ -14,6 +15,9 @@ import java.util.concurrent.TimeUnit;
 /**
  * 登录拦截器：解析 JWT → 校验 Redis 会话 → 写入 UserContext。
  * Redis 会话让服务端可以主动失效（改密码、封号后旧令牌立刻作废），并在每次请求时滑动续期。
+ *
+ * <p>写进上下文的客户端 IP 走 {@link ClientIpResolver#resolve}：与黑名单过滤器、限流切面
+ * 共用同一套解析规则（否则"黑名单按一个 IP 封、限流按另一个 IP 计数"，封了等于没封）。
  */
 @Component
 @RequiredArgsConstructor
@@ -40,7 +44,7 @@ public class AuthInterceptor implements HandlerInterceptor {
             UserContext.set(new UserContext.LoginUser(
                     Long.valueOf(claims.getSubject()),
                     String.valueOf(claims.get("role")),
-                    clientIp(request)));
+                    ClientIpResolver.resolve(request)));
             return true;
         } catch (Exception e) {
             return reject(response, "token 无效");
@@ -66,13 +70,5 @@ public class AuthInterceptor implements HandlerInterceptor {
             return header.substring(7);
         }
         return null;
-    }
-
-    private String clientIp(HttpServletRequest request) {
-        String ip = request.getHeader("X-Forwarded-For");
-        if (ip == null || ip.isBlank()) {
-            ip = request.getRemoteAddr();
-        }
-        return ip.split(",")[0].trim();
     }
 }

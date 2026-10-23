@@ -58,12 +58,14 @@ public class SlidingWindowAspect {
         Method method = ((MethodSignature) point.getSignature()).getMethod();
         SlidingWindowLimit annotation = method.getAnnotation(SlidingWindowLimit.class);
 
+        // 客户端 IP 先算一次：IP 维度拿它当分桶身份，被限流时拿它记违规，同一个请求只解析一次。
+        String clientIp = currentClientIp();
         String identity = switch (annotation.dimension()) {
             case USER -> String.valueOf(UserContext.userId() == null ? "anonymous" : UserContext.userId());
             // 未登录接口（比如登录、注册）走不到拦截器，UserContext 是空的，
             // 这时必须从当前 HTTP 请求里取真实 IP —— 否则所有客户端的登录请求会挤进同一个桶，
             // 变成"全局限流"，一个人刷就能把别人挡住。
-            case IP -> currentClientIp();
+            case IP -> clientIp;
             case GLOBAL -> "global";
         };
 
@@ -76,8 +78,15 @@ public class SlidingWindowAspect {
         if (!allowed) {
             // 被限流即计一次违规：同一个 IP 反复被限流说明它在刷，累计到阈值就提前封掉，
             // 让后续请求在 BlacklistFilter 层就被拒——不用再跑这段 Lua。
+            //
+            // 这里记的必须是【客户端 IP】，不是分桶身份 identity：
+            // 黑名单只按 IP 查（BlacklistService#isBanned + BlacklistFilter），
+            // USER 维度下 identity 是 userId、GLOBAL 维度下是字符串 "global"，
+            // 拿它们去记会写出 black:list:{userId} / black:list:global 这种没人查的死 key，
+            // 主链路（抢购/支付都是 USER 维度）的封禁就完全失效。
+            // 拿不到有效 IP 不用特判：BlacklistService 会忽略 unknown-ip 与空白。
             // 失败在 BlacklistService 内部被吞掉（fail-open），不会影响 429 的抛出。
-            blacklistService.recordViolation(identity);
+            blacklistService.recordViolation(clientIp);
             log.warn("触发滑动窗口限流, key={}, method={}", bucketKey, method.getName());
             throw BizException.tooManyRequests(annotation.message());
         }
