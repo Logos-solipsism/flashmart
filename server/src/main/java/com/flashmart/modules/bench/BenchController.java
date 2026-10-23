@@ -69,4 +69,16 @@ public class BenchController {
     public R<Map<String, Object>> resetCacheLoadCount(@RequestParam String key) {
         return R.ok(benchService.resetCacheLoadCount(key));
     }
+
+    @Operation(summary = "黑名单取证：Lua 调用次数 / 黑名单拒绝次数 / 某 IP 是否被封")
+    @GetMapping("/blacklist-stats")
+    public R<Map<String, Object>> blacklistStats(@RequestParam(required = false) String ip) {
+        return R.ok(benchService.blacklistStats(ip));
+    }
+
+    @Operation(summary = "重置黑名单（给 ip 只清该 IP；不给则清所有 black:* 键并清零计数器）")
+    @PostMapping("/blacklist/reset")
+    public R<Map<String, Object>> resetBlacklist(@RequestParam(required = false) String ip) {
+        return R.ok(benchService.resetBlacklist(ip));
+    }
 }

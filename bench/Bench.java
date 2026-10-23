@@ -139,6 +139,7 @@ public class Bench {
                 case "ratelimit" -> expRateLimit();
                 case "timeout" -> expTimeout();
                 case "pay" -> expPay();
+                case "blacklist" -> expBlacklist();
                 default -> {
                     System.out.println("[错误] 未知实验: " + exp);
                     printUsage();
@@ -261,6 +262,8 @@ public class Bench {
         System.out.println("        超时关单：抢购后不支付，force-timeout 触发关单，验证库存回滚");
         System.out.println("  --exp pay       --activity 9001");
         System.out.println("        支付链路 + 重复支付幂等");
+        System.out.println("  --exp blacklist --activity 9001");
+        System.out.println("        IP 黑名单：伪造 XFF 连打触发封禁，封禁后请求在过滤器层被拒（不再跑限流 Lua）");
         System.out.println();
         System.out.println("示例:");
         System.out.println("  java Bench.java --exp prepare --users 60");
@@ -564,6 +567,14 @@ public class Bench {
     }
 
     static HttpResult call(String method, String path, String token, String jsonBody) {
+        return call(method, path, token, jsonBody, null);
+    }
+
+    /**
+     * 带自定义请求头的版本（黑名单实验用：伪造 X-Forwarded-For 冒充攻击者 IP）。
+     * headers 是偶数个元素，形如 "名字", "值", "名字", "值", ...
+     */
+    static HttpResult call(String method, String path, String token, String jsonBody, String[] headers) {
         long t0 = System.nanoTime();
         try {
             HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(base + path))
@@ -575,6 +586,9 @@ public class Bench {
                 b.method(method, HttpRequest.BodyPublishers.noBody());
             }
             if (token != null && !token.isBlank()) b.header("Authorization", "Bearer " + token);
+            if (headers != null) {
+                for (int i = 0; i + 1 < headers.length; i += 2) b.header(headers[i], headers[i + 1]);
+            }
             HttpResponse<byte[]> resp = http().send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
             long us = (System.nanoTime() - t0) / 1000;
             return new HttpResult(resp.statusCode(), new String(resp.body(), StandardCharsets.UTF_8), us, null);
@@ -635,6 +649,43 @@ public class Bench {
 
     static Api get_(String path, String token) {
         return api(call("GET", path, token, null));
+    }
+
+    /** 带 X-Forwarded-For 的 POST（伪造客户端 IP） */
+    static Api postFromIp(String path, String token, String xff) {
+        return api(call("POST", path, token, null, new String[]{"X-Forwarded-For", xff}));
+    }
+
+    /** 带 X-Forwarded-For 的真实抢购（IP 维度 identity 就是伪造出来的那个 IP） */
+    static Api sendSeckillFromIp(String token, String xff) {
+        return postFromIp("/api/seckill/" + activity, token, xff);
+    }
+
+    static Api resetBlacklist(String token, String ip) {
+        String path = "/api/bench/blacklist/reset" + (ip == null || ip.isBlank() ? "" : "?ip=" + enc(ip));
+        Api a = post(path, token);
+        if (!a.ok()) System.out.println("  [错误] 重置黑名单失败: " + a.describe());
+        return a;
+    }
+
+    static Map<String, Object> blacklistStats(String token, String ip) {
+        String path = "/api/bench/blacklist-stats" + (ip == null || ip.isBlank() ? "" : "?ip=" + enc(ip));
+        Api a = get_(path, token);
+        if (!a.ok()) {
+            System.out.println("  [错误] 读取黑名单统计失败: " + a.describe());
+            return null;
+        }
+        return asMap(a.data);
+    }
+
+    static long statLong(Map<String, Object> stats, String field) {
+        if (stats == null || stats.get(field) == null) return -1;
+        return lng(stats.get(field));
+    }
+
+    static String statStr(Map<String, Object> stats, String field) {
+        if (stats == null || stats.get(field) == null) return "未获取到";
+        return String.valueOf(stats.get(field));
     }
 
     static Api post(String path, String token) {
@@ -1687,4 +1738,181 @@ public class Bench {
         verdict(pay2.code == 0 && "PAID".equals(str(get(pay2.data, "status"))), "第二次支付幂等返回：" + pay2.message);
         verdict("PAID".equals(finalState), "订单最终状态 " + finalState + "（支付后不会被超时关单回滚库存）");
     }
+
+    // ==================================================================
+    // 实验 10：blacklist —— 应用层 IP 黑名单
+    // 验证：反复被限流的 IP 会被提前封禁，封禁后请求在过滤器层就被 429 拒绝，
+    //       限流 Lua 一次都不跑（用 SlidingWindowLimiter 的调用次数证明），且封禁按 IP 隔离。
+    // 阈值靠启动参数调小（yml 默认 20 次 / 300 秒不许改）：
+    //   java -jar server/target/flashmart-server.jar --spring.profiles.active=bench \
+    //        --flashmart.blacklist.violation-threshold=5 --flashmart.blacklist.ban-seconds=60
+    // ==================================================================
+    static void expBlacklist() {
+        section("实验 10：应用层 IP 黑名单（blacklist）");
+        String token = benchToken();
+        if (token == null) return;
+        String attackerIp = "203.0.113.7";
+        String otherIp = "198.51.100.9";
+        kv("活动", activity);
+        kv("攻击者 IP（伪造 X-Forwarded-For）", attackerIp);
+        kv("对照 IP", otherIp);
+        kv("服务端规则", "限流拒绝累计达阈值即封禁（启动参数 violation-threshold=5 / ban-seconds=60）");
+        note("攻击者 IP 是伪造的 X-Forwarded-For：这既是本实验的取证手段，也是黑名单的已知弱点；");
+        note("     真实部署要在最外层网关剥离外部 XFF 并写入可信头，否则换 IP 即可绕过。");
+        System.out.println();
+
+        resetBlacklist(token, null);
+        resetActivity(token, activity, stock, true);
+        waitQuiet(token, activity, 5000);
+
+        // ① 打前基线
+        Map<String, Object> before = blacklistStats(token, attackerIp);
+        String[] statHeader = {"阶段", "limiterCalls", "blacklistRejected", "banned(" + attackerIp + ")"};
+        printTable(statHeader, List.<String[]>of(
+                new String[]{"打之前", statStr(before, "limiterCalls"), statStr(before, "blacklistRejected"),
+                        statStr(before, "banned")}
+        ));
+
+        // ② 1 秒内 10 个并发：5 个被限流拒绝（每人 1 秒 5 次）→ 违规计数达到阈值 5 → 封禁
+        System.out.println();
+        note("第 1 阶段：从 " + attackerIp + " 在 1 秒内并发 10 次抢购（限流窗口每人 5 次/秒）");
+        List<Supplier<Api>> tasks = new ArrayList<>();
+        for (int i = 0; i < 10; i++) tasks.add(() -> sendSeckillFromIp(token, attackerIp));
+        Api[] burst = burst(tasks);
+        int http200 = 0, http429 = 0, otherStatus = 0;
+        Map<String, Integer> messages = new LinkedHashMap<>();
+        for (Api a : burst) {
+            if (a.httpStatus == 200) http200++;
+            else if (a.httpStatus == 429) http429++;
+            else otherStatus++;
+            messages.merge("HTTP " + a.httpStatus + " (code=" + a.code + ") " + a.message, 1, Integer::sum);
+        }
+        kv("并发耗时", String.format(Locale.ROOT, "%.3f s", lastBurstMicros / 1_000_000.0));
+        printTable(new String[]{"HTTP 状态", "次数"}, List.of(
+                new String[]{"200", String.valueOf(http200)},
+                new String[]{"429", String.valueOf(http429)},
+                new String[]{"其他", String.valueOf(otherStatus)}
+        ));
+        printTable(new String[]{"服务端返回（原文）", "次数"}, new ArrayList<>(messages.entrySet().stream()
+                .map(e -> new String[]{e.getKey(), String.valueOf(e.getValue())}).toList()));
+
+        Map<String, Object> afterBurst = blacklistStats(token, attackerIp);
+        printTable(statHeader, List.<String[]>of(
+                new String[]{"打完后", statStr(afterBurst, "limiterCalls"), statStr(afterBurst, "blacklistRejected"),
+                        statStr(afterBurst, "banned")}
+        ));
+        // banned 为 null 说明请求没落到后端（比如没开 bench profile），此时别写 PASS
+        boolean bannedAfterBurst = afterBurst != null && Boolean.TRUE.equals(afterBurst.get("banned"));
+        if (!bannedAfterBurst) {
+            note("注意：此刻该 IP 还没被封。除了限流拒绝数没到阈值，也可能是这次连打大部分请求没走到限流"
+                    + "（例如活动状态不对、token 失效）。后面的结论只在前面的 PASS 行成立时才有意义。");
+        }
+        long callsBefore = statLong(before, "limiterCalls");
+        long callsAfterBurst = statLong(afterBurst, "limiterCalls");
+        long burstLua = (callsAfterBurst < 0 || callsBefore < 0) ? -1 : callsAfterBurst - callsBefore;
+        verdict(burstLua > 0, "突发阶段跑了 " + burstLua + " 次限流 Lua（证明这一段确实经过了限流）");
+
+        // ③ 封禁后再从同一 IP 打 10 次：全部 429，且 limiterCalls 一点都不涨 → 没跑 Lua
+        System.out.println();
+        note("第 2 阶段：封禁后从 " + attackerIp + " 再打 10 次（期望全部 429 且 limiterCalls 不增长）");
+        Map<String, Object> beforeBlocked = blacklistStats(token, attackerIp);
+        long blockedBaseCalls = statLong(beforeBlocked, "limiterCalls");
+        long blockedBaseRejected = statLong(beforeBlocked, "blacklistRejected");
+
+        List<Supplier<Api>> blockedTasks = new ArrayList<>();
+        for (int i = 0; i < 10; i++) blockedTasks.add(() -> sendSeckillFromIp(token, attackerIp));
+        Api[] blocked = burst(blockedTasks);
+
+        int blocked429 = 0, blockedOther = 0;
+        boolean allBody429 = true;
+        String blockedSample = "";
+        for (Api a : blocked) {
+            if (a.httpStatus == 429 && a.code == 429) blocked429++;
+            else blockedOther++;
+            if (!(a.httpStatus == 429 && a.code == 429)) allBody429 = false;
+            if (blockedSample.isEmpty()) blockedSample = a.describe();
+        }
+        kv("并发耗时", String.format(Locale.ROOT, "%.3f s", lastBurstMicros / 1_000_000.0));
+        printTable(new String[]{"HTTP 状态", "次数"}, List.of(
+                new String[]{"429", String.valueOf(blocked429)},
+                new String[]{"其他", String.valueOf(blockedOther)}
+        ));
+        kv("首次响应样本", blockedSample);
+
+        Map<String, Object> afterBlocked = blacklistStats(token, attackerIp);
+        long blockedCalls = statLong(afterBlocked, "limiterCalls");
+        long blockedRejected = statLong(afterBlocked, "blacklistRejected");
+        long luaDelta = (blockedCalls < 0 || blockedBaseCalls < 0) ? -1 : blockedCalls - blockedBaseCalls;
+        long rejectDelta = (blockedRejected < 0 || blockedBaseRejected < 0) ? -1 : blockedRejected - blockedBaseRejected;
+
+        printTable(new String[]{"指标", "封禁前", "封禁后", "增量"}, List.of(
+                new String[]{"limiterCalls（限流 Lua 调用次数）", String.valueOf(blockedBaseCalls), String.valueOf(blockedCalls), String.valueOf(luaDelta)},
+                new String[]{"blacklistRejected（过滤器拒绝次数）", String.valueOf(blockedBaseRejected), String.valueOf(blockedRejected), String.valueOf(rejectDelta)},
+                new String[]{"banned(" + attackerIp + ")", statStr(beforeBlocked, "banned"), statStr(afterBlocked, "banned"), "-"}
+        ));
+
+        // ④ 换一个 IP 打 3 次：不受该封禁影响（证明按 IP 隔离）
+        System.out.println();
+        note("第 3 阶段：换 " + otherIp + " 打 3 次（期望不受封禁影响，且它自己没被封）");
+        List<Api> otherResults = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            otherResults.add(sendSeckillFromIp(token, otherIp));
+            if (i < 2) sleepMs(500); // 500ms 间隔：稳稳落在限流窗口（1 秒 5 次）之内
+        }
+        Map<String, Object> otherStats = blacklistStats(token, otherIp);
+        List<String[]> otherRows = new ArrayList<>();
+        int otherNot429 = 0;
+        for (int i = 0; i < otherResults.size(); i++) {
+            Api a = otherResults.get(i);
+            boolean banned429 = a.httpStatus == 429 && a.code == 429;
+            if (!banned429) otherNot429++;
+            otherRows.add(new String[]{String.valueOf(i + 1), "HTTP " + a.httpStatus, "code=" + a.code,
+                    a.message, banned429 ? "被拒(429)" : "未被封禁"});
+        }
+        printTable(new String[]{"第几次", "HTTP", "code", "message", "是否受封禁影响"}, otherRows);
+        kv("banned(" + otherIp + ")", statStr(otherStats, "banned"));
+
+        // ⑤ 收尾：重置黑名单与取证计数器
+        System.out.println();
+        resetBlacklist(token, null);
+        Map<String, Object> finalStats = blacklistStats(token, attackerIp);
+        printTable(new String[]{"收尾状态", "值"}, List.of(
+                new String[]{"limiterCalls（已清零）", statStr(finalStats, "limiterCalls")},
+                new String[]{"blacklistRejected（已清零）", statStr(finalStats, "blacklistRejected")},
+                new String[]{"banned(" + attackerIp + ")（已解封）", statStr(finalStats, "banned")}
+        ));
+
+        System.out.println();
+        System.out.println("  ---- 小结（可直接引用） ----");
+        verdict(burstLua > 0, "阶段 1：突发 " + http429 + " 次 429，其中限流写入了违规计数（这段跑了 " + burstLua + " 次限流 Lua）");
+        verdict(bannedAfterBurst, "阶段 1：违规累计到阈值后 " + attackerIp + " 被封禁（banned=" + statStr(afterBurst, "banned") + "）");
+        verdict(blocked429 == 10, "阶段 2：封禁后 10 次请求全部 429（实际 " + blocked429 + "/10）");
+        verdict(luaDelta == 0, "阶段 2：限流 Lua 调用次数增量为 " + luaDelta + "（封禁请求在过滤器层就被拒，没跑 Lua）");
+        verdict(allBody429, "阶段 2：响应体是 code=429 的黑名单拒绝（不是限流切面抛出的 429）");
+        verdict(otherNot429 == 3, "阶段 3：" + otherIp + " 的 3 次请求都没被封禁影响（" + otherNot429 + "/3 非 429）：封禁按 IP 隔离");
+        verdict("false".equals(statStr(finalStats, "banned")), "阶段 4：收尾重置后 " + attackerIp + " 已恢复（banned=false）");
+    }
+
+    /**
+     * 等 release 后的 MQ 消息落库干净（统计类实验的通用前置）。
+     * orderCount 连续两次读数不变就认为收敛；超时则如实提示，不美化数字。
+     */
+    static void waitQuiet(String token, long activityId, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        long last = -1;
+        int stable = 0;
+        while (System.currentTimeMillis() < deadline) {
+            Map<String, Object> st = benchStats(token, activityId);
+            long orders = st == null ? -1 : lng(st.get("orderCount"));
+            if (orders == last) {
+                if (++stable >= 2) return;
+            } else {
+                stable = 0;
+                last = orders;
+            }
+            sleepMs(500);
+        }
+        note("等待 orderCount 收敛超时（" + timeoutMs + " ms），后续统计可能偏高");
+    }
 }
+

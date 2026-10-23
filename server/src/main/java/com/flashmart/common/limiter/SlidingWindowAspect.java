@@ -1,9 +1,10 @@
 package com.flashmart.common.limiter;
 
+import com.flashmart.common.blacklist.BlacklistService;
+import com.flashmart.common.blacklist.ClientIpResolver;
 import com.flashmart.common.context.UserContext;
 import com.flashmart.common.exception.BizException;
 import com.flashmart.common.trace.TraceUtil;
-import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
@@ -29,8 +30,12 @@ import java.util.UUID;
 public class SlidingWindowAspect {
 
     private final SlidingWindowLimiter limiter;
+    private final BlacklistService blacklistService;
 
-    /** 当前请求的客户端 IP：优先用拦截器写进上下文的，没有就现取（未登录接口） */
+    /**
+     * 当前请求的客户端 IP：优先用拦截器写进上下文的（JWT 鉴权时已经解析过一次），
+     * 没有就现取（未登录接口）。解析规则收敛在 ClientIpResolver，禁止在这里再写第二份。
+     */
     private String currentClientIp() {
         UserContext.LoginUser loginUser = UserContext.get();
         if (loginUser != null && loginUser.clientIp() != null) {
@@ -40,16 +45,11 @@ public class SlidingWindowAspect {
             ServletRequestAttributes attributes =
                     (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
             if (attributes == null) {
-                return "unknown-ip";
+                return ClientIpResolver.UNKNOWN_IP;
             }
-            HttpServletRequest request = attributes.getRequest();
-            String ip = request.getHeader("X-Forwarded-For");
-            if (ip == null || ip.isBlank()) {
-                ip = request.getRemoteAddr();
-            }
-            return ip.split(",")[0].trim();
+            return ClientIpResolver.resolve(attributes.getRequest());
         } catch (Exception e) {
-            return "unknown-ip";
+            return ClientIpResolver.UNKNOWN_IP;
         }
     }
 
@@ -74,6 +74,10 @@ public class SlidingWindowAspect {
         boolean allowed = limiter.tryAcquire(bucketKey, annotation.windowSeconds(),
                 annotation.maxRequests(), member);
         if (!allowed) {
+            // 被限流即计一次违规：同一个 IP 反复被限流说明它在刷，累计到阈值就提前封掉，
+            // 让后续请求在 BlacklistFilter 层就被拒——不用再跑这段 Lua。
+            // 失败在 BlacklistService 内部被吞掉（fail-open），不会影响 429 的抛出。
+            blacklistService.recordViolation(identity);
             log.warn("触发滑动窗口限流, key={}, method={}", bucketKey, method.getName());
             throw BizException.tooManyRequests(annotation.message());
         }

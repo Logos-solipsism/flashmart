@@ -1,7 +1,9 @@
 package com.flashmart.modules.bench;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.flashmart.common.blacklist.BlacklistService;
 import com.flashmart.common.cache.RedisCacheClient;
+import com.flashmart.common.limiter.SlidingWindowLimiter;
 import com.flashmart.common.exception.BizException;
 import com.flashmart.common.mq.MqEvents;
 import com.flashmart.common.mq.MqProducer;
@@ -16,10 +18,14 @@ import com.flashmart.modules.seckill.service.SeckillStockService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Profile;
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -48,6 +54,9 @@ public class BenchService {
     private final SeckillStockService stockService;
     private final RedisCacheClient cacheClient;
     private final MqProducer mqProducer;
+    private final StringRedisTemplate redis;
+    private final BlacklistService blacklistService;
+    private final SlidingWindowLimiter limiter;
 
     /** 重置某个活动：库存（DB + Redis）、已购记录、缓存回源计数、该活动下的订单 */
     @Transactional(rollbackFor = Exception.class)
@@ -181,5 +190,49 @@ public class BenchService {
     public Map<String, Object> resetCacheLoadCount(String key) {
         cacheClient.evict("cache:loadcount:" + key);
         return Map.of("key", key, "loadCount", 0);
+    }
+
+    /**
+     * 黑名单取证：Lua 到底跑没跑，用 SlidingWindowLimiter 的调用次数来证明。
+     * banned 只在传入 ip 时才有意义（不传返回 null）。
+     */
+    public Map<String, Object> blacklistStats(String ip) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("limiterCalls", limiter.callCount());
+        result.put("blacklistRejected", blacklistService.rejectedCount());
+        result.put("banned", ip == null || ip.isBlank() ? null : blacklistService.isBanned(ip));
+        return result;
+    }
+
+    /**
+     * 重置黑名单：给了 ip 只清这个 IP；没给就 SCAN 清掉所有 black:* 键。
+     * 同时把两个取证计数器（Lua 调用数 / 黑名单拒绝数）清零，保证每轮实验从 0 开始。
+     */
+    public Map<String, Object> resetBlacklist(String ip) {
+        int deleted = 0;
+        if (ip != null && !ip.isBlank()) {
+            blacklistService.reset(ip);
+        } else {
+            // 用 SCAN 而不是 KEYS：压测机上 Redis 里可能有大量 key，KEYS 会阻塞整个实例
+            List<String> keys = new ArrayList<>();
+            ScanOptions options = ScanOptions.scanOptions().match("black:*").count(200).build();
+            try (Cursor<String> cursor = redis.scan(options)) {
+                while (cursor.hasNext()) {
+                    keys.add(cursor.next());
+                }
+            }
+            if (!keys.isEmpty()) {
+                redis.delete(keys);
+                deleted = keys.size();
+            }
+        }
+        limiter.resetCallCount();
+        blacklistService.resetRejectedCount();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ip", ip);
+        result.put("deletedKeys", deleted);
+        result.put("limiterCalls", 0);
+        result.put("blacklistRejected", 0);
+        return result;
     }
 }

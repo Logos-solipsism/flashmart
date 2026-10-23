@@ -51,7 +51,15 @@ java Bench.java --exp cache-penetrate --activity 99999 --times 200   # 6. 缓存
 java Bench.java --exp ratelimit                     # 7. 限流
 java Bench.java --exp timeout                       # 8. 超时关单 + 库存回滚
 java Bench.java --exp pay                           # 9. 支付 + 重复支付幂等
+java Bench.java --exp blacklist                     # 10. IP 黑名单（需用阈值=5 启动后端，见下）
 ```
+
+> 实验 10 需要把黑名单阈值调小，启动参数覆盖（**yml 默认 20 / 300 不动**）：
+>
+> ```bash
+> java -jar server/target/flashmart-server.jar --spring.profiles.active=bench \
+>      --flashmart.blacklist.violation-threshold=5 --flashmart.blacklist.ban-seconds=60
+> ```
 
 ### 参数
 
@@ -154,6 +162,32 @@ reset → 抢购 → 轮询到 `PENDING_PAY` → 支付 → **再支付一次**�
 第二次仍然 `PAID`，`data.message=订单已支付，无需重复支付`（幂等，不重复扣款）；
 最终订单状态 `PAID`，库存不会被超时关单回滚。
 
+### 实验 10 `blacklist` —— 应用层 IP 黑名单（不再跑限流 Lua）
+背景：滑动窗口限流每拒绝一次请求都要跑一次 Redis Lua（清 ZSet + 统计 + 写入），
+被持续攻击时**限流组件自己会把 Redis 打满**。黑名单的作用是让已确认在刷的 IP
+在 Servlet 过滤器层就被 429 拒掉，连 Lua 都不跑。
+
+步骤（全部用伪造的 `X-Forwarded-For` 冒充攻击者 IP）：
+1. `POST /api/bench/blacklist/reset` 清黑名单 + 两个取证计数器，reset 活动并等 MQ 排空；
+2. 从 `203.0.113.7` **1 秒内并发 10 次**真实抢购 —— 限流窗口每人 5 次/秒，
+   被拒的那几次各记一次违规，累计到阈值（实验用 5）即封禁 `black:list:203.0.113.7`（TTL 60 秒）；
+3. 封禁后再从同一 IP 打 10 次：**期望全部 HTTP 429 + code=429**（响应体是黑名单的
+   `访问过于频繁，已被临时限制，请稍后再试`，不是限流切面抛的那条），
+   且 `limiterCalls`（SlidingWindowLimiter 的 Lua 调用次数）**增量为 0** —— 这就是"没跑 Lua"的证据；
+4. 换 `198.51.100.9` 打 3 次：不受该封禁影响（**封禁按 IP 隔离**）；
+5. 收尾再 reset 一次，打印归零后的计数器与 `banned=false`。
+
+取证接口（bench profile）：
+`GET /api/bench/blacklist-stats[?ip=]` → `{limiterCalls, blacklistRejected, banned}`；
+`POST /api/bench/blacklist/reset[?ip=]`（不给 ip 则 SCAN 清掉所有 `black:*` 并清零计数器）。
+
+**读法**：阶段 2 的 `limiterCalls` 增量为 0 才是黑名单生效（否则说明请求又跑到限流里去了）；
+`blacklistRejected` 增量应等于阶段 2 的请求数。
+
+**已知弱点（如实记录）**：客户端 IP 取 `X-Forwarded-For` 的第一段，而这个头是客户端可伪造的，
+所以攻击者**换着伪造 IP 就能绕开按 IP 维度的黑名单**。本实验正是靠这一点伪造出攻击者 IP 的。
+要根治得在最外层网关剥离外部 XFF 并写入可信头（应用侧只读可信头），属于部署层改动，本轮未做。
+
 ---
 
 ## 4. 实测结果（本机真实跑出来的数字）
@@ -172,6 +206,7 @@ reset → 抢购 → 轮询到 `PENDING_PAY` → 支付 → **再支付一次**�
 | cache-miss | `--exp cache-miss --concurrency 100` | 后端空载：100 并发 → 回源 **1** 次；后端被压时：回源 100 次（见下） |
 | timeout | `--exp timeout` | `PENDING_PAY → TIMEOUT`，DB/Redis 库存各 +1（100→99→100） |
 | pay | `--exp pay` | 两次支付都 `PAID`，第二次 message=`订单已支付，无需重复支付` |
+| blacklist | `--exp blacklist`（阈值=5 / 封禁 60 秒） | 数字待补：本轮只交付代码与单测，未启动服务做端到端（Docker 中间件当前是停的），实验 10 的实测数字留到推送 GitHub 时统一跑 |
 
 **async vs sync（同样 50 并发 / 2000 请求 / stock=1000000）**：异步版吞吐 **176 vs 39 req/s（约 4.5 倍）**，
 单请求平均耗时 **280.66 ms vs 1259.62 ms（降约 78%）**，P99 **329 ms vs 1462 ms（降约 77%）** ——
