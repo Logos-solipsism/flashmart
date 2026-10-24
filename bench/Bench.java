@@ -1870,7 +1870,11 @@ public class Bench {
         // 若请求间隔太短（<1 秒），对照 IP 收到的是"限流 429"（手速太快啦），
         // 与"黑名单 429"根本不是一回事 —— 只看 429 就会误判成"它被一起封了"。
         System.out.println();
-        note("第 3 阶段：换 " + otherIp + " 打 3 次，每次间隔 1200ms（绕开 1 秒滑动窗口，避免混进限流窗口）");
+        note("第 3 阶段：先等 1200ms 让阶段 1 的窗口滑出，再换 " + otherIp + " 打 3 次，每次间隔 1200ms");
+        // 阶段内先等一次：阶段 1 往这个用户的 1 秒窗口里写了 5 个成员，不等的话本阶段第 1 次请求
+        // 会落在那段窗口尾部、收到「手速太快啦」的限流 429，把"有没有被封"的判据污染成无法归因的 429。
+        // 等窗口滑出后，本阶段里任何一次限流 429 都真实意味着"间隔设置有问题"——判据才是可证伪的。
+        sleepMs(1200);
         List<Api> otherResults = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
             otherResults.add(sendSeckillFromIp(token, otherIp));
@@ -1896,10 +1900,13 @@ public class Bench {
                     a.message, kind});
         }
         printTable(new String[]{"第几次", "HTTP", "code", "message", "响应分类（按文案）"}, otherRows);
-        printTable(new String[]{"响应分类", "次数", "期望"}, List.of(
-                new String[]{"黑名单拒绝（文案含「" + blacklistMark + "」）", String.valueOf(otherBlacklistRejected), "0：对照 IP 没被封"},
-                new String[]{"限流拒绝（文案含「" + rateLimitMark + "」）", String.valueOf(otherRateLimited), "0：1200ms 间隔已绕开 1 秒窗口"},
-                new String[]{"业务结果（限购 / 成功）", String.valueOf(otherBusiness), "3：请求确实走到了业务层"}
+        printTable(new String[]{"响应分类", "次数", "期望（严格值）"}, List.of(
+                new String[]{"黑名单拒绝（文案含「" + blacklistMark + "」）", String.valueOf(otherBlacklistRejected),
+                        "0：对照 IP 没被封"},
+                new String[]{"限流拒绝（文案含「" + rateLimitMark + "」）", String.valueOf(otherRateLimited),
+                        "0：阶段内先等 1.2s + 每次间隔 1.2s，本阶段出现任何一次都说明间隔设置有问题"},
+                new String[]{"业务结果（限购 / 成功）", String.valueOf(otherBusiness),
+                        "3：同一演示用户的名额已在阶段 1 用掉，3 次预期都是「每人限购」而不是 success"}
         ));
         boolean otherBanned = otherStats != null && Boolean.TRUE.equals(otherStats.get("banned"));
         kv("banned(" + otherIp + ")", statStr(otherStats, "banned"));
