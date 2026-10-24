@@ -38,7 +38,7 @@ public class BlacklistFilter extends OncePerRequestFilter {
 
     private final BlacklistService blacklistService;
 
-    /** 关掉后连 Redis 都不查 */
+    /** 总开关：这里先短路（省掉一次 service 调用）；BlacklistService 内部还会兜底判一次 */
     @Value("${flashmart.blacklist.enabled:true}")
     private boolean enabled;
 
@@ -46,6 +46,7 @@ public class BlacklistFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
         try {
+            // enabled=false：连 service 都不调（service 里还有一层兜底判断，两层都关掉才是真的零 Redis 访问）
             if (enabled && isApiRequest(request.getRequestURI())) {
                 String ip = ClientIpResolver.resolve(request);
                 if (blacklistService.isBanned(ip)) {

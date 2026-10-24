@@ -139,4 +139,26 @@ class BlacklistServiceTest {
         service.resetRejectedCount();
         assertEquals(0, service.rejectedCount());
     }
+
+    @Test
+    @DisplayName("总开关关闭：isBanned 直接 false，完全不查 Redis")
+    void isBannedSkipsRedisWhenDisabled() {
+        ReflectionTestUtils.setField(service, "enabled", false);
+
+        assertFalse(service.isBanned(IP));
+
+        verify(redis, never()).hasKey(anyString());
+    }
+
+    @Test
+    @DisplayName("总开关关闭：recordViolation 完全不写 Redis（禁用期不累计违规）")
+    void recordViolationSkipsRedisWhenDisabled() {
+        ReflectionTestUtils.setField(service, "enabled", false);
+
+        service.recordViolation(IP);
+
+        verify(valueOps, never()).increment(anyString());
+        verify(redis, never()).expire(anyString(), any(Duration.class));
+        verify(redis, never()).delete(anyString());
+    }
 }

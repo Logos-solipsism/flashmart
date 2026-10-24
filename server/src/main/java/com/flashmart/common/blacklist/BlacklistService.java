@@ -21,6 +21,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * 窗口内违规数达到阈值就封 ban-seconds 秒。这几个数字都是<b>策略值</b>，不是实测最优值，
  * 生产要按真实流量调（见 application.yml 的 flashmart.blacklist 段）。
  *
+ * <p><b>总开关</b>（{@code flashmart.blacklist.enabled}）：关掉后本类读不查、写不写，全程零 Redis 访问
+ * —— 过滤器层先短路省掉一次调用，本类再兜底判断一次，两层都不依赖"调用方记得判断"。
+ * 边界说明：<b>禁用期间不累计违规</b>——否则重新打开开关的那一刻，禁用期攒下的计数会立刻
+ * 对历史 IP 生效（攒的账在恢复瞬间集体兑现）。
+ *
  * <p>两条铁律：
  * <ul>
  *   <li><b>fail-open</b>：Redis 异常一律当作「没封 / 不计」，黑名单是保护手段，
@@ -38,7 +43,10 @@ public class BlacklistService {
 
     private final StringRedisTemplate redis;
 
-    /** 总开关：关掉后过滤器直接放行，读 Redis 的动作也省掉 */
+    /**
+     * 总开关：false = 本类读不查、写不写，全程零 Redis 访问。
+     * 判断做在这里（而不是只靠调用方记得先判断），过滤器那层只是先短路省一次调用。
+     */
     @Value("${flashmart.blacklist.enabled:true}")
     private boolean enabled;
 
@@ -57,9 +65,9 @@ public class BlacklistService {
     /** 被黑名单拒掉的请求数：进程内计数，零网络开销，仅供压测取证 */
     private final AtomicLong rejectedCount = new AtomicLong();
 
-    /** 该 IP 当前是否在封禁名单里；ip 无效或 Redis 异常都返回 false（fail-open） */
+    /** 该 IP 当前是否在封禁名单里；总开关关闭 / ip 无效 / Redis 异常都返回 false（fail-open） */
     public boolean isBanned(String ip) {
-        if (!isValidIp(ip)) {
+        if (!enabled || !isValidIp(ip)) {
             return false;
         }
         try {
@@ -85,7 +93,8 @@ public class BlacklistService {
      * 本项目不做这件事；账号维度由 Redis 会话失效（改密码/封号）承担。
      */
     public void recordViolation(String ip) {
-        if (!isValidIp(ip)) {
+        // 总开关关闭时连计数都不写：禁用期攒下的违规会在重新打开开关的瞬间集体生效
+        if (!enabled || !isValidIp(ip)) {
             return;
         }
         try {
