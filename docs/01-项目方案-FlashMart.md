@@ -44,6 +44,7 @@
 | 接口文档 | Knife4j 4.5.0（`knife4j-openapi3-jakarta-spring-boot-starter`），`http://localhost:18090/doc.html` | `pom.xml` |
 | 前端 | Vue 3.5 + Vue Router 4 + Vite 6，手写 CSS，无 UI 组件库、无状态管理库，HTTP 用原生 `fetch` | `web/package.json`、`web/src/api.js` |
 | 压测 | 纯 JDK 单文件 `bench/Bench.java`（无第三方依赖，含手写 JSON 解析器） | `bench/Bench.java` |
+| 限流与封禁 | 注解式滑动窗口限流（Redis ZSet + Lua + AOP）+ 应用层 IP 黑名单（过滤器层） | `common/limiter`、`common/blacklist` |
 
 明确没有引入的：**MinIO、LangChain4j、Redisson**。本项目的加锁需求由"Lua 原子脚本 + 数据库唯一索引 + 条件更新"覆盖，不需要分布式锁组件；商品图片用 `product.cover_color` 色块代替，不需要对象存储。
 
@@ -88,6 +89,8 @@
                                             session:token:{userId}   登录会话
 
 数据流一句话说明：**买家侧的写请求只到 Redis 与 MQ 就返回，数据库的写入发生在消费端；商家侧的写请求先落数据库，再删缓存。**
+
+入口处理顺序（本轮新增黑名单）：**TraceIdFilter（先写 traceId）→ BlacklistFilter（IP 黑名单，`/api/**` 命中即 429 返回且不调 `chain`，因此不进限流切面、不跑 Lua）→ AuthInterceptor（鉴权 + 写 UserContext）→ 控制器 / 限流切面**。黑名单之所以排在 TraceIdFilter 之后，是因为拒绝日志要带上 traceId——排查「哪个 IP 在什么时候被封、封之前打了什么」全指望它。
 
 ## 6. 七个技术点与代码落点
 
@@ -158,6 +161,16 @@
 - **使用点**：`SeckillController.seckill`（USER，1 秒 5 次）、`OrderController.pay`（USER，1 秒 3 次）、`AuthController.login`（IP，1 秒 20 次）。
 - **关键类**：`SlidingWindowLimit`、`SlidingWindowAspect`、`SlidingWindowLimiter`、`lua/sliding_window.lua`。
 - **实测口径**：同一用户 1 秒内并发 10 次抢购 → **5 次通过 + 5 次 HTTP 429**（配置 `maxRequests=5`）；改成每 1.2 秒 1 次匀速请求，**全部通过、429 为 0** —— 滑动窗口只拦突发，不拦匀速。登录的 IP 维度同样实测过：并发 30 次登录 → **通过 20 次 + 限流 10 次**（阈值 20 次/秒），说明 IP 身份是按真实来源 IP 分桶的（`SlidingWindowAspect` 对未登录接口从当前 HTTP 请求取 IP），而不是所有登录请求共用一个桶。
+
+- **限流自身的保护：应用层 IP 黑名单**（本轮新增，与限流是两个组件、职责不同）：
+  - **痛点**：限流保护的是业务，保护不了自己——被限流的请求每次仍要跑一遍 `lua/sliding_window.lua` + 一次 Redis，攻击者可以无限刷，限流组件变成被消耗的一方；
+  - **方案**：`BlacklistService` 只用两个 Redis key 记状态——`black:violation:{ip}`（违规计数）与 `black:list:{ip}`（封禁标记）。限流（滑动窗口）拒绝一次就记一次违规，**只在计数为 1 时 `EXPIRE` 违规窗口**（窗口从第一次违规起算，不会被持续流量无限顺延）；计数达到阈值就 `SETEX` 封禁并把违规计数 `DEL`（下次封禁重新计数）；`BlacklistFilter` 在过滤器层判定，命中即 429 返回且不调 `chain`；
+  - **为什么是过滤器层**：越靠前越省（不进 MVC、不进切面、不跑 Lua）、覆盖面不依赖注解（整个 `/api/**`）、`@Order(Ordered.HIGHEST_PRECEDENCE + 1)` 排在 `TraceIdFilter` 之后所以拒绝日志带 traceId；
+  - **取 IP 只有一份实现**：`ClientIpResolver`（`X-Forwarded-For` 第一段 → `getRemoteAddr()` → 兜底 `unknown-ip`）由拦截器 / 限流切面 / 黑名单过滤器共用，避免"限流按 A 的 IP 判、黑名单按 B 的 IP 封"；
+  - **降级**：`BlacklistService` 与 `BlacklistFilter` 整体 try/catch，异常只打 warn 后放行（fail-open，判断标准与限流一致）；后果是 **Redis 不可用时黑名单与限流同时失效**；
+  - **配置**：`flashmart.blacklist` 四项 —— `enabled: true`、`violation-threshold: 20`、`violation-window-seconds: 60`、`ban-seconds: 300`。**四个都是策略值，不是实测最优值**，生产必须按真实流量分布调；
+  - **关键类与取证口子**：`ClientIpResolver`、`BlacklistService`、`BlacklistFilter`；bench profile 下另有 `GET /api/bench/blacklist-stats?ip=` 与 `POST /api/bench/blacklist/reset?ip=`；
+  - **边界**（详见第 10 节）：`X-Forwarded-For` 可伪造 → 换个伪造 IP 就能绕开；惩罚落 IP 不落账号 → NAT 后的其它账号会被一起挡；外层网关黑名单没做 → 每次被拒仍要跑一次 Redis 查询，只有真被封的 IP 才"连 Lua 都不跑"。
 
 ### 技术点 7：RocketMQ 延迟消息超时关单 + 库存回滚 + 状态条件更新
 
@@ -323,6 +336,8 @@
 | POST | `/api/bench/force-timeout/{orderNo}` | 立即投递关单消息（延迟 1 秒），用于快速验证超时关单 |
 | GET | `/api/bench/cache-load-count?key=` | 查询某个缓存 key 的累计回源次数 |
 | POST | `/api/bench/cache-load-count/reset?key=` | 重置回源计数 |
+| GET | `/api/bench/blacklist-stats?ip=` | 黑名单取证：返回 `{limiterCalls, blacklistRejected, banned}`；`limiterCalls` 是 `SlidingWindowLimiter` 每次 `tryAcquire` 的进程内计数——用来证明"命中黑名单时一次 Lua 都没跑" |
+| POST | `/api/bench/blacklist/reset?ip=` | 黑名单复位：传 `ip` 只清该 IP；不传则 SCAN 清理所有 `black:*` 并清零两个计数器 |
 
 ## 10. 项目边界（明确不做什么）
 
@@ -338,6 +353,10 @@
 | 对象存储（MinIO 等） | 商品图不是本项目的技术重点 | `product.cover_color` 色块，前端直接渲染颜色 |
 | 死信监控与重放 | 消费失败重试到上限后，消息会进 RocketMQ 按消费组自动创建的死信主题 `%DLQ%cg_order_create`；但项目里**没有对应的消费者与重放接口**（`MqTopics` 里连常量都没有，曾经的 `DLQ_ORDER_CREATE` 已作为死代码删掉） | 消费失败先走 RocketMQ 阶梯重试；超过重试次数后进死信，只能去 Dashboard 人工处理，属于待补项 |
 | 管理后台 / 运营台 | 角色只有买家与商家 | 商家工作台（`/merchant` 路由 + `MerchantController`）已覆盖商品与活动维护 |
+| 剥离外部 `X-Forwarded-For`、网关侧封禁 | 需要在最外层网关剥离外部 XFF 并写入可信头（部署层改动），本轮刻意不做；网关层（粗粒度限流 / 自动黑名单）也没有 | 应用层的 IP 解析优先读 XFF 第一段：**攻击者每次换一个伪造 IP，就能绕开按 IP 的黑名单与 IP 维度限流**；每次被拒的请求仍要走一次应用层 Redis 查询，只有真被封的 IP 才"连限流 Lua 都不跑" |
+| 账号级封禁 | 应用层 IP 黑名单的惩罚落在 IP 上；按账号处置必须把检查点放到鉴权之后，本项目不做 | 账号维度的处置由 Redis 会话失效承担（删 `session:token:{userId}` 即失效）；代价是同一 NAT 出口下的其它账号会被一起挡住 |
+| 黑名单阈值 / 窗口 / 封禁时长的调参依据 | `flashmart.blacklist` 的 20 次 / 60 秒 / 300 秒是**策略值**，没有任何真实流量调参依据，也没做"只观测不拦截"的灰度 | 生产按真实流量分布调（与限流阈值同一套方法）；演示默认值不等于最优值 |
+| 黑名单在 Redis 故障期间的有效性 | `black:list:{ip}` 与 `black:violation:{ip}` 都在 Redis 里，且判定与写入都是 fail-open | Redis 不可用时黑名单与限流同时失效，那段时间等于没有黑名单；不单独为它做兜底 |
 
 ## 11. 设计决策与取舍记录（FAQ）
 
