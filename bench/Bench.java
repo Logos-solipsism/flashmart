@@ -1761,6 +1761,11 @@ public class Bench {
         kv("攻击者 IP（伪造 X-Forwarded-For）", attackerIp);
         kv("对照 IP", otherIp);
         kv("服务端规则", "限流拒绝累计达阈值即封禁（启动参数 violation-threshold=5 / ban-seconds=60）");
+        // HTTP 429 有两个来源，判据必须按【文案】分层，只看状态码会把两层混在一起、结论无法归因：
+        //   blacklistMark = 黑名单过滤器写死的拒绝文案（封禁生效的证据）
+        //   rateLimitMark = 抢购接口 @SlidingWindowLimit 的 message（滑动窗口拦截，与封禁无关）
+        String blacklistMark = "访问过于频繁，已被临时限制";
+        String rateLimitMark = "手速太快啦";
         note("攻击者 IP 是伪造的 X-Forwarded-For：这既是本实验的取证手段，也是黑名单的已知弱点；");
         note("     真实部署要在最外层网关剥离外部 XFF 并写入可信头，否则换 IP 即可绕过。");
         System.out.println();
@@ -1830,13 +1835,14 @@ public class Bench {
         for (int i = 0; i < 10; i++) blockedTasks.add(() -> sendSeckillFromIp(token, attackerIp));
         Api[] blocked = burst(blockedTasks);
 
-        int blocked429 = 0, blockedOther = 0;
-        boolean allBody429 = true;
+        int blocked429 = 0, blockedOther = 0, blockedBlacklist = 0;
         String blockedSample = "";
         for (Api a : blocked) {
-            if (a.httpStatus == 429 && a.code == 429) blocked429++;
+            boolean is429 = a.httpStatus == 429 && a.code == 429;
+            if (is429) blocked429++;
             else blockedOther++;
-            if (!(a.httpStatus == 429 && a.code == 429)) allBody429 = false;
+            // 429 也可能是限流切面抛的，必须文案对上才算"黑名单拒绝"
+            if (is429 && a.message.contains(blacklistMark)) blockedBlacklist++;
             if (blockedSample.isEmpty()) blockedSample = a.describe();
         }
         kv("并发耗时", String.format(Locale.ROOT, "%.3f s", lastBurstMicros / 1_000_000.0));
@@ -1845,6 +1851,7 @@ public class Bench {
                 new String[]{"其他", String.valueOf(blockedOther)}
         ));
         kv("首次响应样本", blockedSample);
+        kv("其中黑名单文案的 429", blockedBlacklist + "/" + blocked429 + "（其余若出现，就是限流切面抛的 429）");
 
         Map<String, Object> afterBlocked = blacklistStats(token, attackerIp);
         long blockedCalls = statLong(afterBlocked, "limiterCalls");
@@ -1859,24 +1866,42 @@ public class Bench {
         ));
 
         // ④ 换一个 IP 打 3 次：不受该封禁影响（证明按 IP 隔离）
+        // 判据按【文案】分层，不能只看状态码：抢购是 USER 维度分桶，
+        // 若请求间隔太短（<1 秒），对照 IP 收到的是"限流 429"（手速太快啦），
+        // 与"黑名单 429"根本不是一回事 —— 只看 429 就会误判成"它被一起封了"。
         System.out.println();
-        note("第 3 阶段：换 " + otherIp + " 打 3 次（期望不受封禁影响，且它自己没被封）");
+        note("第 3 阶段：换 " + otherIp + " 打 3 次，每次间隔 1200ms（绕开 1 秒滑动窗口，避免混进限流窗口）");
         List<Api> otherResults = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
             otherResults.add(sendSeckillFromIp(token, otherIp));
-            if (i < 2) sleepMs(500); // 500ms 间隔：稳稳落在限流窗口（1 秒 5 次）之内
+            if (i < 2) sleepMs(1200); // 1200ms：与 expOneUser 里"绕开 1 秒窗口"的做法一致
         }
         Map<String, Object> otherStats = blacklistStats(token, otherIp);
         List<String[]> otherRows = new ArrayList<>();
-        int otherNot429 = 0;
+        int otherBlacklistRejected = 0, otherRateLimited = 0, otherBusiness = 0;
         for (int i = 0; i < otherResults.size(); i++) {
             Api a = otherResults.get(i);
-            boolean banned429 = a.httpStatus == 429 && a.code == 429;
-            if (!banned429) otherNot429++;
+            String kind;
+            if (a.message.contains(blacklistMark)) {
+                otherBlacklistRejected++;
+                kind = "黑名单拒绝（封禁生效）";
+            } else if (a.message.contains(rateLimitMark)) {
+                otherRateLimited++;
+                kind = "限流拒绝（滑动窗口，与封禁无关）";
+            } else {
+                otherBusiness++;
+                kind = "业务结果（没被拦）";
+            }
             otherRows.add(new String[]{String.valueOf(i + 1), "HTTP " + a.httpStatus, "code=" + a.code,
-                    a.message, banned429 ? "被拒(429)" : "未被封禁"});
+                    a.message, kind});
         }
-        printTable(new String[]{"第几次", "HTTP", "code", "message", "是否受封禁影响"}, otherRows);
+        printTable(new String[]{"第几次", "HTTP", "code", "message", "响应分类（按文案）"}, otherRows);
+        printTable(new String[]{"响应分类", "次数", "期望"}, List.of(
+                new String[]{"黑名单拒绝（文案含「" + blacklistMark + "」）", String.valueOf(otherBlacklistRejected), "0：对照 IP 没被封"},
+                new String[]{"限流拒绝（文案含「" + rateLimitMark + "」）", String.valueOf(otherRateLimited), "0：1200ms 间隔已绕开 1 秒窗口"},
+                new String[]{"业务结果（限购 / 成功）", String.valueOf(otherBusiness), "3：请求确实走到了业务层"}
+        ));
+        boolean otherBanned = otherStats != null && Boolean.TRUE.equals(otherStats.get("banned"));
         kv("banned(" + otherIp + ")", statStr(otherStats, "banned"));
 
         // ⑤ 收尾：重置黑名单与取证计数器
@@ -1895,8 +1920,11 @@ public class Bench {
         verdict(bannedAfterBurst, "阶段 1：违规累计到阈值后 " + attackerIp + " 被封禁（banned=" + statStr(afterBurst, "banned") + "）");
         verdict(blocked429 == 10, "阶段 2：封禁后 10 次请求全部 429（实际 " + blocked429 + "/10）");
         verdict(luaDelta == 0, "阶段 2：限流 Lua 调用次数增量为 " + luaDelta + "（封禁请求在过滤器层就被拒，没跑 Lua）");
-        verdict(allBody429, "阶段 2：响应体是 code=429 的黑名单拒绝（不是限流切面抛出的 429）");
-        verdict(otherNot429 == 3, "阶段 3：" + otherIp + " 的 3 次请求都没被封禁影响（" + otherNot429 + "/3 非 429）：封禁按 IP 隔离");
+        verdict(blocked429 == 10 && blockedBlacklist == 10, "阶段 2：10 次全部是黑名单拒绝（HTTP 429 + code=429 + 黑名单文案，实际 " + blockedBlacklist + "/10）");
+        verdict(otherBlacklistRejected == 0 && !otherBanned,
+                "阶段 3：" + otherIp + " 收到 0 次黑名单拒绝（黑名单拒绝数=" + otherBlacklistRejected
+                        + "；其中限流拒绝 " + otherRateLimited + " 次、业务结果 " + otherBusiness
+                        + " 次）且 banned=" + statStr(otherStats, "banned") + "：封禁按 IP 隔离，只封住了在刷的那个 IP");
         verdict("false".equals(statStr(finalStats, "banned")), "阶段 4：收尾重置后 " + attackerIp + " 已恢复（banned=false）");
     }
 
