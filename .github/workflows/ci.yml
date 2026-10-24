@@ -1,0 +1,48 @@
+# FlashMart CI：后端单元测试 + 前端构建
+#
+# 为什么 CI 里不需要 MySQL / Redis / RocketMQ：后端单元测试全部是纯单测（Redis、MQ 等外部依赖
+# 都用 mock，不起 Spring 上下文），所以不需要任何中间件服务，直接 mvn test 就能跑。
+# 本次不加任何依赖中间件或端到端压测的步骤。
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: 后端单元测试
+        working-directory: server
+        run: mvn -B test
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖（npm ci，按 lockfile 精确安装）
+        working-directory: web
+        run: npm ci
+
+      - name: 前端构建
+        working-directory: web
+        run: npm run build
