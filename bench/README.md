@@ -209,7 +209,7 @@ reset → 抢购 → 轮询到 `PENDING_PAY` → 支付 → **再支付一次**�
 | cache-miss | `--exp cache-miss --concurrency 100` | 后端空载：100 并发 → 回源 **1** 次；后端被压时：回源 100 次（见下） |
 | timeout | `--exp timeout` | `PENDING_PAY → TIMEOUT`，DB/Redis 库存各 +1（100→99→100） |
 | pay | `--exp pay` | 两次支付都 `PAID`，第二次 message=`订单已支付，无需重复支付` |
-| blacklist | `--exp blacklist`（阈值=5 / 封禁 60 秒） | 数字待补：本轮只交付代码与单测，未启动服务做端到端（Docker 中间件当前是停的），实验 10 的实测数字留到推送 GitHub 时统一跑 |
+| blacklist | `--exp blacklist`（阈值=5 / 封禁 60 秒） | 阶段 1：1 秒内 10 并发 → `HTTP 200 × 5`（1 success + 4 限购）+ `HTTP 429 × 5`，突发耗时 0.102 s，`limiterCalls` 0→10，违规到阈值后 `banned=true`；阶段 2：封禁后同 IP 再打 10 次 → `429 = 10/10`（全为黑名单文案），`limiterCalls` 增量 0、`blacklistRejected` 增量 10；阶段 3：对照 IP 打 3 次 → 黑名单拒绝 0 次、`banned=false` |
 
 **async vs sync（同样 50 并发 / 2000 请求 / stock=1000000）**：异步版吞吐 **176 vs 39 req/s（约 4.5 倍）**，
 单请求平均耗时 **280.66 ms vs 1259.62 ms（降约 78%）**，P99 **329 ms vs 1462 ms（降约 77%）** ——
