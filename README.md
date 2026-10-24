@@ -10,7 +10,8 @@
     <img src="https://img.shields.io/badge/Lua-%E5%8E%9F%E5%AD%90%E8%84%9A%E6%9C%AC-2C2D72?style=flat-square" alt="Lua">
     <img src="https://img.shields.io/badge/RocketMQ-5-D77310?style=flat-square" alt="RocketMQ 5">
     <img src="https://img.shields.io/badge/MyBatis--Plus-3.5.5-1F6FEB?style=flat-square" alt="MyBatis-Plus">
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="MIT License"></a>
+    <a href="https://github.com/Logos-solipsism/flashmart/actions/workflows/ci.yml"><img src="https://github.com/Logos-solipsism/flashmart/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="MIT License"></a>
   </p>
 </div>
 
