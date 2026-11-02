@@ -14,8 +14,7 @@ const tip = ref('')
 const form = reactive({
   phone: '',
   password: '',
-  nickname: '',
-  role: 'BUYER'
+  nickname: ''
 })
 
 function switchMode(next) {
@@ -49,8 +48,7 @@ async function submit() {
         body: {
           phone: form.phone,
           password: form.password,
-          nickname: form.nickname.trim(),
-          role: form.role
+          nickname: form.nickname.trim()
         }
       })
       tip.value = '注册成功，请使用该手机号登录'
@@ -110,14 +108,6 @@ async function submit() {
             <label>昵称</label>
             <input v-model.trim="form.nickname" class="input" type="text" placeholder="请输入昵称" />
           </div>
-
-          <div class="field">
-            <label>账号角色</label>
-            <select v-model="form.role" class="select">
-              <option value="BUYER">买家（参与抢购）</option>
-              <option value="MERCHANT">商家（发布商品与活动）</option>
-            </select>
-          </div>
         </template>
 
         <button class="btn btn-primary btn-block" type="submit" :disabled="loading">
@@ -126,7 +116,7 @@ async function submit() {
       </form>
 
       <div class="login-foot">
-        买家账号可参与限时抢购，商家账号可发布商品与抢购活动
+        注册后即为买家账号（参与抢购）；商家账号由演示数据预置，用 13811110001 / 123456 登录可发布商品与活动
       </div>
     </div>
   </div>
