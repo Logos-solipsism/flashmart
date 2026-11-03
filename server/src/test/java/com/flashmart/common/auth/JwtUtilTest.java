@@ -11,11 +11,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 密钥校验要在启动期挡下两类配置事故：
- * 沿用仓库内置的默认密钥（等同密钥已公开），以及密钥不足 32 字节（JJWT 签发时才报 WeakKeyException，线上才暴露）。
+ * 压根没配（仓库不提供内置默认值，照文档启动就会踩到），以及密钥不足 32 字节
+ * （JJWT 签发时才报 WeakKeyException，线上才暴露）。
  */
 class JwtUtilTest {
-
-    private static final String DEFAULT_SECRET = "flashmart-dev-secret-key-please-change-in-production";
 
     private JwtUtil jwtUtilWith(String secret) {
         JwtUtil jwtUtil = new JwtUtil();
@@ -25,10 +24,20 @@ class JwtUtilTest {
     }
 
     @Test
-    @DisplayName("密钥仍是内置默认值：启动校验失败，报错要点明用 JWT_SECRET 覆盖")
-    void defaultSecretIsRejected() {
+    @DisplayName("密钥未配置（空白）：启动校验失败，报错要点明设 JWT_SECRET，而不是说“请提供 JWT_SECRET”")
+    void blankSecretIsRejected() {
         IllegalStateException error = assertThrows(IllegalStateException.class,
-                () -> jwtUtilWith(DEFAULT_SECRET).validateSecret());
+                () -> jwtUtilWith("").validateSecret());
+
+        assertTrue(error.getMessage().contains("未配置"), error.getMessage());
+        assertTrue(error.getMessage().contains("JWT_SECRET"), error.getMessage());
+    }
+
+    @Test
+    @DisplayName("密钥未配置（null）：与空白走同一条启动失败分支")
+    void nullSecretIsRejected() {
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> jwtUtilWith(null).validateSecret());
 
         assertTrue(error.getMessage().contains("JWT_SECRET"), error.getMessage());
     }
