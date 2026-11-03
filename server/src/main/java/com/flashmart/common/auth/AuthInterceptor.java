@@ -37,7 +37,10 @@ public class AuthInterceptor implements HandlerInterceptor {
         try {
             Claims claims = jwtUtil.parse(token);
             String sessionKey = SESSION_KEY_PREFIX + claims.getSubject();
-            if (Boolean.FALSE.equals(redis.hasKey(sessionKey))) {
+            // 比对会话里存的 token 本身：只判断 key 是否存在的话，同一账号重新登录换发令牌后，
+            // 旧令牌在有效期内仍然可用——「改密码/封号后立刻失效」就只对「把 key 删掉」这一种情况成立
+            String cachedToken = redis.opsForValue().get(sessionKey);
+            if (cachedToken == null || !cachedToken.equals(token)) {
                 return reject(response, "登录已失效，请重新登录");
             }
             redis.expire(sessionKey, 24, TimeUnit.HOURS);

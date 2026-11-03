@@ -6,12 +6,14 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -29,6 +31,7 @@ class AuthInterceptorTest {
 
     private final JwtUtil jwtUtil = mock(JwtUtil.class);
     private final StringRedisTemplate redis = mock(StringRedisTemplate.class);
+    private final ValueOperations<String, String> valueOps = mock(ValueOperations.class);
     private final Claims claims = mock(Claims.class);
     private final AuthInterceptor interceptor = new AuthInterceptor(jwtUtil, redis);
 
@@ -42,7 +45,8 @@ class AuthInterceptorTest {
         when(jwtUtil.parse("t")).thenReturn(claims);
         when(claims.getSubject()).thenReturn("9003");
         when(claims.get("role")).thenReturn("BUYER");
-        when(redis.hasKey("session:token:9003")).thenReturn(true);
+        when(redis.opsForValue()).thenReturn(valueOps);
+        when(valueOps.get("session:token:9003")).thenReturn("t");
     }
 
     @Test
@@ -86,5 +90,22 @@ class AuthInterceptorTest {
         assertTrue(interceptor.preHandle(request, new MockHttpServletResponse(), new Object()));
 
         assertEquals("10.1.2.3", UserContext.get().clientIp());
+    }
+
+    /** 同一账号重新登录后会话里换成了新令牌，旧令牌必须立刻失效，而不是等 key 被删 */
+    @Test
+    @DisplayName("会话里的 token 与请求携带的不一致：401")
+    void staleTokenIsRejected() throws Exception {
+        when(jwtUtil.parse("t")).thenReturn(claims);
+        when(claims.getSubject()).thenReturn("9003");
+        when(redis.opsForValue()).thenReturn(valueOps);
+        when(valueOps.get("session:token:9003")).thenReturn("newer-token");
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer t");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(request, response, new Object()));
+        assertEquals(401, response.getStatus());
     }
 }
