@@ -55,6 +55,10 @@ rocketmq:
     retry-times-when-send-failed: 3
 
 flashmart:
+  # 外部 Agent 服务（只读接口 /api/agent/**）的鉴权配置。
+  # 不给默认值：未配置令牌时这组接口整体 401，而不是对外开放（fail-closed）。
+  agent:
+    service-token: ${AGENT_SERVICE_TOKEN:}
   jwt:
     # 无内置默认值：必须由环境变量 JWT_SECRET 提供至少 32 字节的随机串，未配置或过短会在启动期直接失败（见 JwtUtil#validateSecret）
     secret: ${JWT_SECRET:}
