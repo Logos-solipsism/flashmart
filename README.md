@@ -81,7 +81,7 @@
 
 - **traceId 全链路** — HTTP 入口生成（或沿用调用方的 `X-Trace-Id`），随消息属性传到消费者，一次抢购跨接口 / MQ / 消费端的日志能用同一个 ID 串起来。
 - **消费幂等表** — `mq_consume_log` 用 `msg_id` 唯一索引判断首次消费，区分处理中/成功/失败。
-- **配置全外置** — 数据库、Redis、RocketMQ、JWT 密钥全部支持环境变量覆盖，本地有默认值、上线改环境变量即可。
+- **配置全外置** — 数据库、Redis、RocketMQ 支持环境变量覆盖、本地有默认值；JWT 密钥没有可用默认值，必须用 `JWT_SECRET` 提供**至少 32 字节**的随机串（沿用内置默认值或密钥太短会在启动时被拒，见 `JwtUtil` 的启动校验）。
 - **压测工具** — 仓库自带一个纯 JDK 的压测/实验工具（`bench/Bench.java`，无第三方依赖），10 个实验覆盖超卖、一人一单、削峰、击穿、穿透、限流、超时关单、支付幂等、应用层 IP 黑名单。
 
 ## 系统流程
@@ -156,7 +156,7 @@ docker compose up -d          # MySQL 13307 / Redis 6380 / RocketMQ 9877 / Dashb
 ### 2. 启动后端
 
 ```bash
-cd server && mvn spring-boot:run
+cd server && JWT_SECRET=$(openssl rand -hex 32) mvn spring-boot:run   # JWT_SECRET 必填且不少于 32 字节，否则启动报错
 ```
 
 接口文档：<http://localhost:18090/doc.html>
