@@ -39,7 +39,8 @@ spring:
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    # 默认不打 SQL；需要排查时用环境变量打开，例如 MYBATIS_LOG_IMPL=org.apache.ibatis.logging.stdout.StdOutImpl
+    log-impl: ${MYBATIS_LOG_IMPL:org.apache.ibatis.logging.nologging.NoLoggingImpl}
   global-config:
     db-config:
       logic-delete-field: deleted
