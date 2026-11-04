@@ -10,14 +10,28 @@ services:
       MYSQL_ROOT_PASSWORD: root123456
       MYSQL_DATABASE: flashmart
       TZ: Asia/Shanghai
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    # 服务端字符集直接作为 mysqld 参数传给官方 entrypoint：不经过配置文件，不受宿主机文件权限影响。
+    # 客户端字符集（初始化导入 .sql 时用的是 mysql 客户端）见下面的 entrypoint 说明。
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        # Windows 的 bind mount 权限固定是 777，而 MySQL 会静默忽略 world-writable 的配置文件
+        # （日志：World-writable config file '/etc/mysql/conf.d/charset.cnf' is ignored）。
+        # 所以不直接挂进 conf.d，而是挂到 /opt 再以 0644 复制进去：权限由镜像内文件系统保证。
+        install -m 0644 /opt/flashmart-client.cnf /etc/mysql/conf.d/charset.cnf
+        exec /usr/local/bin/docker-entrypoint.sh mysqld \
+          --character-set-server=utf8mb4 \
+          --collation-server=utf8mb4_unicode_ci
     volumes:
       - mysql-data:/var/lib/mysql
       # 逐个挂载并加数字前缀：容器按文件名字母序执行初始化脚本
       - ./server/src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./server/src/main/resources/db/data.sql:/docker-entrypoint-initdb.d/02-data.sql
-      # 初始化用的 mysql 客户端必须是 utf8mb4，否则中文种子数据会二次编码成乱码
-      - ./deploy/mysql-client.cnf:/etc/mysql/conf.d/charset.cnf
+      # 初始化用的 mysql 客户端必须是 utf8mb4，否则中文种子数据会二次编码成乱码；
+      # 故意不挂到 /etc/mysql/conf.d，由上面的 entrypoint 复制成 0644 后再生效
+      - ./deploy/mysql-client.cnf:/opt/flashmart-client.cnf:ro
 
   redis:
     image: redis:7.2

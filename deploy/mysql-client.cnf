@@ -1,6 +1,11 @@
 # MySQL 客户端字符集配置。
 # 容器初始化时用 mysql 客户端执行 db/*.sql，如果不显式指定字符集，
 # 中文会被当成 latin1 再编码一次，落库就变成"双重编码"的乱码（现象：接口新建的数据正常，种子数据全是问号/怪字符）。
+#
+# 注意：这个文件在 docker-compose.yml 里挂到容器内的 /opt/flashmart-client.cnf，
+# 而**不是**直接挂到 /etc/mysql/conf.d/——Windows 的 bind mount 权限恒为 777，
+# MySQL 遇到 world-writable 的配置文件会整个忽略、只打印一行 Warning，配置等于没写。
+# 容器 entrypoint 会先 install -m 0644 复制到 /etc/mysql/conf.d/charset.cnf 再启动 mysqld。
 [client]
 default-character-set=utf8mb4
 

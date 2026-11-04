@@ -153,6 +153,45 @@ docker compose up -d          # MySQL 13307 / Redis 6380 / RocketMQ 9877 / Dashb
 
 首次启动会自动执行 `server/src/main/resources/db/` 下的建表与演示数据脚本。
 
+> ⚠️ **改了初始化脚本或字符集配置后，必须 `docker compose down -v` 再起。**
+> 初始化脚本只在数据卷为空时执行一次；直接 `restart` / `up -d` 用的是旧数据卷，
+> 新的 `schema.sql` / `data.sql` / 字符集设置都不会生效，看起来"改了没用"。
+> `-v` 会删掉 `mysql-data`、`redis-data`、`rocketmq-store` 三个卷，本地数据一起清空。
+
+#### 中文种子数据乱码：成因与修法
+
+如果 `flash_activity.title` 之类的中文字段查出来是「星野 X1 耳机 限时抢购」之外的怪字符，
+用 `select hex(title) from flash_activity where id=9001` 判定：正确值是 `E6989FE9878E...`，
+如果看到 `C3A6CB9C...` 就是**双重编码**（UTF-8 字节被当成 latin1 读入、再按 utf8mb4 存了一次）。
+
+成因是一条链，缺一环都不出问题：
+
+1. Windows 的 bind mount 到容器里权限恒为 `777`；
+2. MySQL 对 **world-writable 的配置文件直接忽略**，只在日志里留一行
+   `mysql: [Warning] World-writable config file '/etc/mysql/conf.d/charset.cnf' is ignored.`
+   —— 配置写对了但等于没写；
+3. 初始化阶段执行 `.sql` 用的是 **mysql 客户端**（不是 server），它默认按 `latin1` 读文件，
+   于是 `.sql` 里的 UTF-8 中文被当成 latin1 → 转成 utf8mb4 落库，中文就二次编码了。
+   注意只设 `--character-set-server` 修不了这个问题：服务端字符集影响的是"存"和"取"，
+   而错在客户端**读文件**那一步。
+
+因此 `docker-compose.yml` 里不再把配置直接挂进 `/etc/mysql/conf.d/`，而是：
+
+- 挂到 `/opt/flashmart-client.cnf`，由容器 entrypoint 用 `install -m 0644`
+  复制进 `/etc/mysql/conf.d/charset.cnf` 再启动 mysqld —— 权限由镜像内文件系统保证，与宿主机无关；
+- 服务端字符集改用 mysqld 命令行参数 `--character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci`，
+  不经过任何配置文件，同样不受挂载权限影响。
+
+验证：
+
+```bash
+docker compose down -v && docker compose up -d mysql   # 等初始化跑完
+docker logs flashmart-mysql 2>&1 | grep -i world-writable   # 应当没有任何输出
+docker exec flashmart-mysql mysql -uroot -proot123456 --default-character-set=utf8mb4 \
+  -e "select hex(title) from flashmart.flash_activity where id=9001"
+# 期望以 E6989FE9878E 开头
+```
+
 ### 2. 启动后端
 
 ```bash
@@ -272,3 +311,4 @@ cd web && npm install && npm run dev
 ## 更新记录
 
 - 2026-11-02 · 校准实测口径：缓存击穿结论补充「后端被压」条件；冒烟脚本状态由 ✅ 改为待补；移除不可复核的撞号数字
+- 2026-11-04 · 修复中文种子数据双重编码：MySQL 客户端字符集配置改由容器 entrypoint 以 0644 落地（Windows 挂载 777 会被 MySQL 忽略），服务端字符集改为 mysqld 参数；补 `docker compose down -v` 说明
