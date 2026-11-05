@@ -25,6 +25,50 @@
 
 ---
 
+## 如何三分钟验证这个项目
+
+不用信文档里的数字，下面每条都能在仓库里查到对应文件和命令：
+
+**① 起全栈中间件**（MySQL / Redis / RocketMQ / Dashboard 五个服务，端口 13307 / 6380 / 9877 / 8181）：
+
+```bash
+docker compose up -d          # 对应仓库根目录 docker-compose.yml
+docker compose ps             # 五个服务应为 running
+```
+
+> 注：`docker-compose.yml` **没有使用 compose profile**，`up -d` 会起全部五个服务。
+> 压测用的 `/api/bench/**` 接口靠的是 **Spring profile** `bench`，需用 `mvn spring-boot:run -Dspring-boot.run.profiles=bench` 启动后端才有。
+
+**② 单元测试**（不需要起中间件，测试全部用 mock，不起 Spring 上下文）：
+
+```bash
+cd server && mvn -B test
+```
+
+当前 **18 个测试类 / 95 个测试方法**（按 `@Test` 注解统计，统计命令见下），全部为单元测试：
+
+```pwsh
+(Get-ChildItem -Recurse server/src/test -Filter '*.java' -File | Measure-Object).Count   # 类数 → 18
+(Get-ChildItem -Recurse server/src/test -Filter '*.java' -File |
+  Select-String -Pattern '^\s*@Test\b' | Measure-Object).Count                          # 方法数 → 95
+```
+
+CI（`.github/workflows/ci.yml`）也只是 `mvn -B test` + `npm run build`，不依赖中间件。
+
+**③ 压测工具**（纯 JDK 单文件、无第三方依赖，JDK 17+ 直接运行）：
+
+```bash
+cd bench
+java Bench.java --help                              # 看全部实验
+java Bench.java --exp oversell --stock 100 --users 500      # 不超卖
+java Bench.java --exp cache-miss --concurrency 100          # 缓存击穿
+java Bench.java --exp cache-penetrate --activity 99999 --times 200   # 缓存穿透
+```
+
+前置条件是后端以 `bench` profile 启动，完整实验清单、参数与实测结果见 [bench/README.md](bench/README.md)。
+
+---
+
 ## 项目背景
 
 限时抢购把「缓存、限流、消息队列、并发一致性」四个问题压缩到了同一条主链路上，每个问题都能用数字验收：
@@ -230,7 +274,7 @@ cd web && npm install && npm run dev
 | **超卖验证（30 件库存 / 60 个用户并发）** | 成功 30 次、落库 30 单、**数据库与 Redis 剩余库存都是 0**——成功数 = 落库数 = 总库存，无超卖、库存非负 |
 | 一人一单（同一用户并发 20 次） | 成功 1 次 + 限购 4 次 + 429 共 15 次（限流在限购之前）；改成每 1.2 秒 1 次匀速请求 → 全部被"一人一单"拦下 |
 | 滑动窗口限流 | 1 秒内 10 并发 → **5 通过 + 5 × 429**；匀速请求全部通过 |
-| 缓存击穿（缓存被删后 100 并发，后端空载） | **回源数据库 1 次**，100 个请求总耗时 114 ms。后端被压时回源退化为 100 次（见 `bench/README.md`） |
+| 缓存击穿（缓存被删后 100 并发，后端空载） | **回源数据库 1 次**，100 个请求总耗时 114 ms。**仅后端空载条件成立**：后端被压时兜底分支会退化为回源 100 次（见 `bench/README.md` 第 5 节） |
 | 缓存击穿（逻辑过期瞬间 100 并发） | 全部成功，**只触发 1 次异步重建**，耗时 119 ms |
 | 缓存穿透（查不存在的活动 200 次） | **回源 1 次** |
 | 超时关单 | 生产档位（30 秒）实测：抢购后不支付，**第 30 秒订单状态变为 TIMEOUT**，数据库与 Redis 库存**各回滚 1 件**。压测工具里的 timeout 实验走的是"1 秒档强制关单"接口（便于快速验证），那组观察值是 22 ms |
